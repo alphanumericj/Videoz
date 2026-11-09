@@ -1,10 +1,37 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
+import 'blur_region.dart';
 import 'clip.dart';
 import 'editor_model.dart';
 import 'export_service.dart';
+
+/// One blur, as shown under the timeline: where it starts and ends on the
+/// source timeline, and the stretches where the tracker was unsure.
+class BlurSpan {
+  const BlurSpan({
+    required this.id,
+    required this.start,
+    required this.end,
+    required this.scale,
+    required this.unsure,
+    this.covered,
+    this.label = 'Pixelate',
+  });
+
+  final int id;
+  final Duration start;
+  final Duration end;
+  final PixelScale scale;
+  final List<({Duration start, Duration end})> unsure;
+
+  /// Text blurs: the stretches where text was found and blurred. The rest of
+  /// [start]..[end] is drawn faintly. Null means the whole span is blurred.
+  final List<({Duration start, Duration end})>? covered;
+  final String label;
+}
 
 /// The scrubber + segment strip along the bottom of the editor.
 ///
@@ -23,6 +50,9 @@ class Timeline extends StatelessWidget {
     required this.onSeek,
     required this.onToggleSegment,
     required this.onTransitionTap,
+    this.blurSpans = const [],
+    this.onBlurTap,
+    this.onBlurMenu,
   });
 
   final EditorModel model;
@@ -32,6 +62,11 @@ class Timeline extends StatelessWidget {
   final ValueChanged<Duration> onSeek;
   final ValueChanged<Segment> onToggleSegment;
   final ValueChanged<Duration> onTransitionTap;
+  final List<BlurSpan> blurSpans;
+  final ValueChanged<int>? onBlurTap;
+
+  /// Right-click on a blur bar: the blur's id and the global position.
+  final void Function(int id, Offset global)? onBlurMenu;
 
   @override
   Widget build(BuildContext context) {
@@ -93,11 +128,153 @@ class Timeline extends StatelessWidget {
                 onTransitionTap: onTransitionTap,
               ),
             ),
+            if (blurSpans.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: _BlurBars(
+                  spans: blurSpans,
+                  total: total,
+                  onTap: onBlurTap,
+                  onMenu: onBlurMenu,
+                ),
+              ),
           ],
         );
       },
     );
   }
+}
+
+/// Thin bars under the segment row, one per blur, stacked in lanes when they
+/// overlap in time. Red stretches are where the tracker was unsure.
+class _BlurBars extends StatelessWidget {
+  const _BlurBars({
+    required this.spans,
+    required this.total,
+    required this.onTap,
+    required this.onMenu,
+  });
+
+  final List<BlurSpan> spans;
+  final Duration total;
+  final ValueChanged<int>? onTap;
+  final void Function(int id, Offset global)? onMenu;
+
+  static const _laneHeight = 14.0;
+  static const _gap = 3.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    // Greedy lane assignment: first lane whose last bar ends before this starts.
+    final laneEnds = <Duration>[];
+    final lanes = <int, int>{};
+    final ordered = [...spans]..sort((a, b) => a.start.compareTo(b.start));
+    for (final s in ordered) {
+      var lane = laneEnds.indexWhere((e) => e <= s.start);
+      if (lane < 0) {
+        laneEnds.add(s.end);
+        lane = laneEnds.length - 1;
+      } else {
+        laneEnds[lane] = s.end;
+      }
+      lanes[s.id] = lane;
+    }
+    final height = laneEnds.length * (_laneHeight + _gap) - _gap;
+
+    return LayoutBuilder(builder: (context, c) {
+      final w = c.maxWidth;
+      final totalUs = math.max(1, total.inMicroseconds);
+      double x(Duration d) => w * (d.inMicroseconds / totalUs).clamp(0.0, 1.0);
+      return SizedBox(
+        height: height,
+        child: Stack(
+          children: [
+            for (final s in ordered)
+              Positioned(
+                left: x(s.start),
+                width: math.max(6.0, x(s.end) - x(s.start)),
+                top: lanes[s.id]! * (_laneHeight + _gap),
+                height: _laneHeight,
+                child: Tooltip(
+                  message: '${s.label} '
+                      '${_fmt(s.start)} to ${_fmt(s.end)}'
+                      '${s.unsure.isEmpty ? '' : '\nRed = tracker unsure, please check'}'
+                      '\nRight-click for options',
+                  waitDuration: const Duration(milliseconds: 400),
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: onTap == null ? null : () => onTap!(s.id),
+                    onSecondaryTapUp:
+                        onMenu == null ? null : (d) => onMenu!(s.id, d.globalPosition),
+                    child: CustomPaint(
+                      painter: _BlurBarPainter(
+                        span: s,
+                        color: scheme.tertiary,
+                        unsureColor: const Color(0xFFFF5252),
+                      ),
+                      child: const Align(
+                        alignment: Alignment.centerLeft,
+                        child: Padding(
+                          padding: EdgeInsets.only(left: 3),
+                          child: Icon(Icons.blur_on, size: 11, color: Colors.black87),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+    });
+  }
+}
+
+class _BlurBarPainter extends CustomPainter {
+  _BlurBarPainter({required this.span, required this.color, required this.unsureColor});
+  final BlurSpan span;
+  final Color color;
+  final Color unsureColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final r = RRect.fromRectAndRadius(Offset.zero & size, const Radius.circular(3));
+    final len = math.max(1, span.end.inMicroseconds - span.start.inMicroseconds);
+    final covered = span.covered;
+    if (covered != null) {
+      // Faint over the whole marked range, solid only where text was found.
+      canvas.drawRRect(r, Paint()..color = color.withValues(alpha: 0.18));
+      canvas.drawRRect(
+          r,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1
+            ..color = color.withValues(alpha: 0.6));
+      for (final c in covered) {
+        final x0 = size.width * ((c.start - span.start).inMicroseconds / len).clamp(0.0, 1.0);
+        final x1 = size.width * ((c.end - span.start).inMicroseconds / len).clamp(0.0, 1.0);
+        canvas.save();
+        canvas.clipRRect(r);
+        canvas.drawRect(Rect.fromLTRB(x0, 0, math.max(x1, x0 + 2), size.height), Paint()..color = color);
+        canvas.restore();
+      }
+      return;
+    }
+    canvas.drawRRect(r, Paint()..color = color);
+    for (final u in span.unsure) {
+      final x0 = size.width * ((u.start - span.start).inMicroseconds / len).clamp(0.0, 1.0);
+      final x1 = size.width * ((u.end - span.start).inMicroseconds / len).clamp(0.0, 1.0);
+      canvas.save();
+      canvas.clipRRect(r);
+      canvas.drawRect(Rect.fromLTRB(x0, 0, math.max(x1, x0 + 2), size.height),
+          Paint()..color = unsureColor);
+      canvas.restore();
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _BlurBarPainter old) => true;
 }
 
 /// The segment row: each kept segment shows a mini filmstrip of its own

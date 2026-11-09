@@ -195,6 +195,135 @@ compression level before the save panel opens.
   `lib/export_settings.dart` only holds the names (a unit test keeps them in
   sync).
 
+## Blur boxes (2026-11-09)
+
+Hide a face, a license plate, confidential text: mark the video just before the
+thing appears and just after it disappears (the existing **Mark point**), put the
+playhead on any frame between, press **Blur box**, drag a rectangle over it,
+pick how pixelated (three thumbnails of your own box), and press **Blur**. The
+app follows it through the whole stretch, forward and backward, and pixelates it.
+
+- **Four looks** (see "Blur styles" below). Pixelate comes with three scales (Fine / Medium / Coarse = 10 / 6 / 3 blocks
+  across the box's shorter side, so a small face and a wide banner look alike).
+  Core Image's `CIPixellate`, inside the same custom compositor as page curl and
+  blinds, so the preview and the saved file match.
+- **The stretch you mark is the range.** The app is never asked "is it gone?",
+  only "where is it?". A blur keeps its own clip-local time range, so adding or
+  moving cut points later doesn't change it, and reordering clips doesn't break it.
+- **Tracking** is Apple's Vision object tracker (`VNTrackObjectRequest`) on upright
+  frames shrunk to 960 px, run from the drawn frame forward to the end mark and
+  backward to the start mark (backward by reading one second at a time and
+  feeding it in reverse). About 500 to 750 frames per second; 20 s of 60 fps
+  video took 1.2 s.
+- **The tracker is not trusted.** Tests on `GG.mov` showed it can drift while
+  reporting high confidence (scrolling text clipped by half while it read 0.91),
+  switch to a different object after an occlusion (the rocket hit an asteroid),
+  and shrink onto the most distinctive part of a rotating object. So:
+  - the box is padded 20% on every side (at least 1.2% of the short side), and
+    it can only shrink as fast as the last and next 0.6 s allow (never below 80% of
+    the biggest it was in that window, or a quarter of what you drew). A real
+    zoom-out is gradual, so the box follows it down; a fast wobble (a rotating
+    object's thin side view) is held up. This replaced a fixed 55% floor that
+    stopped the box shrinking when an object receded: measured on the scrolling
+    intro text, width went 0.46 to 0.26 and stalled; now it goes 0.46 to 0.14;
+  - where confidence drops under 0.35 the box is held at its last good position,
+    and that stretch is drawn **red** under the timeline and the box outline turns
+    red on the preview;
+  - exporting with red stretches asks you to check them first;
+  - the preview is the review: the pixelation (and an outline) shows in the player.
+- **Fix box on this frame** (right-click a pixelated area, or a bar under the
+  timeline): redraw the box on a frame where it's off. It re-tracks only between
+  the nearest hand-placed frames on either side, so earlier fixes stay.
+- **Right-click** a pixelated area (or its bar) for Remove blur (the whole stretch),
+  Fix box, and a different pixelation. While drawing, the Blur box button becomes Cancel blur (Escape also cancels), and
+  there's no banner over the video that could cover what you want to box.
+- Blurred video can't use the "convert by copying" shortcut (it would keep the
+  original pixels); it is always re-rendered.
+- Not covered: audio (voices) and file metadata. Watch the exported file through
+  before sharing.
+- Coordinates: a drawn box is converted from the preview canvas to the clip's own
+  displayed frame (`FrameMapper` in `lib/blur_region.dart`, unit tested), because
+  the preview letterboxes clips whose shape differs from the first clip's. The
+  renderer maps it back with the same aspect-fit.
+
+**Bug found and fixed along the way:** the custom compositor (page curl, blinds,
+and now blur) drew rotated clips (phone video) upside down, because the fit
+transform is in AVFoundation's top-left coordinates and Core Image is bottom-left.
+It now flips on the way in and out. Also checked: it reproduces the source's
+colors exactly.
+
+
+## Blur styles (2026-11-09)
+
+Picked in the same dialog as the strength (with previews of your own box), and
+changeable later from the right-click menu:
+
+- **Pixelate**: Fine / Medium / Coarse.
+- **Frosted blur**: a smooth, cloudy-lens Gaussian blur with a feathered edge;
+  Light / Medium / Heavy. A light blur on small text can stay partly legible, so use
+  Heavy for anything that must not be read.
+- **Black box**: solid, nothing recoverable.
+- **Match background**: samples the colors just outside the box on all four sides
+  and fills the box with a smooth blend of them (feathered edge), so text on a plain
+  or gently shaded background mostly vanishes. Works best on plain backgrounds; busy
+  ones come out as a soft smear.
+
+Tried and dropped: a frosted-glass distortion and a fog/white veil (both looked poor).
+Considered but not added: swirl/twirl (reversible, so not safe for hiding anything).
+
+## Blur text (2026-11-09)
+
+A second blur for text, next to **Blur box**. The object blur follows a box through
+a stretch you marked, so after text disappeared it kept pixelating the empty spot.
+Text blur instead *reads* the text and looks for it again, so it finds every place
+the phrase appears (several at once, moving, switching position) and stops when the
+text does.
+
+Flow: mark before and after the text is on screen, put the playhead on a frame where
+it's readable, press **Blur text**, drag a box around it. A dialog shows what was
+read in the box, one editable line each (checkbox to leave one out), and the three
+pixelation previews. **Find and blur** then reads the marked stretch and blurs every
+match.
+
+- **Reading and finding** is Vision's text recognizer (`VNRecognizeTextRequest`,
+  accurate mode, no language correction, so names and street names stay as printed),
+  about 8 frames a second of the marked stretch. `VNRecognizedText.boundingBox(for:)`
+  gives the box of just the matched part of a line, so "123 Main Street" inside
+  "Deliver to 123 Main Street, Tucson AZ" boxes only the address.
+- **Matching** ignores capitals, accents, punctuation and spacing, and forgives
+  misread characters (none for 4 or fewer letters, 1 up to 9, 2 up to 18, 3 beyond).
+  Each phrase line is searched separately; a phrase that wraps across two lines on
+  screen is found as its separate lines only if each was entered separately.
+- **Gaps:** the reader misses frames now and then, so each find also covers 0.2 s
+  before and 0.3 s after, and two finds under 0.8 s apart count as one stretch (both
+  finds' boxes apply across the gap, which also covers motion). The frame you drew
+  on is always covered. These constants live in `BlurRegion` in `lib/blur_region.dart`
+  and are sent to the renderer as ready-made time stretches, so the on-screen outlines
+  and the saved file agree.
+- **Padding** for text is a third of the text's height all round (not a fifth of its
+  width, which on a long phrase would eat the neighboring words).
+- The bar under the timeline is **solid only where text was found and blurred**, faint
+  over the rest of the marked range, and its tooltip says "found in N of M frames read".
+  The search can be cancelled from the status line.
+- **Measured** (`GG.mov`, 1280x588): the careful mode reads about 3 frames a second
+  (the fast mode 80, but it read the phrase in only 7 of 120 frames); a 12 s stretch
+  sampled at 8/s took 9.5 s. On the receding intro paragraph an exact search found the
+  phrase in 38 of 120 frames; fuzzy matching found 63 of 96 and, bridged, covered 8.3 of
+  12 s, stopping where the text became too small to read (about 8 s in). On a synthetic
+  clip with the same address in three places (one static and vanishing at 4 s, one
+  lowercase and drifting, one inside a longer line) and a different address as a decoy:
+  found in 48 of 48 frames, 2 then 3 then 2 boxes at the right moments, the decoy never
+  touched.
+- **Limits:** small, stylized or perspective-warped text is missed on some frames, and
+  the app can't prove text *isn't* there when the reader fails, so the preview is still
+  the review.
+
+**Bug found and fixed along the way:** a video with **no audio track** failed to
+export on the uncompressed path with "Operation Stopped" (the empty audio tracks the
+composition always creates stop `AVAssetExportSession`), which also broke the live
+preview of any edit to a silent clip. Empty audio tracks, and any mix parameters
+pointing at them, are now dropped before exporting.
+
 ## Roadmap
 
 - [x] Join multiple separate clips
@@ -202,6 +331,8 @@ compression level before the save panel opens.
 - [x] More transitions (fade to black, slide) — picked in the same popup as duration
 - [x] Filmstrip thumbnails on the timeline
 - [x] Convert to MP4/MOV and compress on save
+- [x] Blur (pixelate) a tracked box over a marked stretch, with fix and remove
+- [x] Blur text: read it, find every occurrence in the marked stretch, blur them
 - [ ] Bulk "crossfade all joins" convenience control
 - [ ] Draggable / individually-deletable cut points
 - [ ] Live preview without re-render (native AVPlayer view) for long clips

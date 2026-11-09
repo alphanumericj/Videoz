@@ -4,6 +4,7 @@ import CoreImage
 import FlutterMacOS
 import Foundation
 import ImageIO
+import Vision
 
 /// Native, licensing-clean media renderer. The output is a flat list of "pieces"
 /// — each a source file plus an in/out time — joined by an optional crossfade
@@ -19,6 +20,7 @@ class VideoExporter {
   private var progressTimer: Timer?
   private var currentSession: AVAssetExportSession?
   private var currentReader: AVAssetReader?
+  private let cancelFlag = CancelFlag()
   private var currentWriter: AVAssetWriter?
 
   init(messenger: FlutterBinaryMessenger) {
@@ -34,7 +36,16 @@ class VideoExporter {
     let end: Double
     let cfAfter: Double // transition duration into the next piece, seconds
     let typeAfter: String // "crossfade" | "fadeblack" | "slide" | "pagecurl" | "blinds" | "none"
+    let clipId: String // which clip in the app's list this came from (blur regions are per clip)
     var length: Double { max(0, end - start) }
+  }
+
+  private static func num(_ any: Any?) -> Double? { (any as? NSNumber)?.doubleValue }
+
+  private static func normalizedRect(_ any: Any?) -> CGRect? {
+    guard let d = any as? [String: Any], let x = num(d["x"]), let y = num(d["y"]),
+          let w = num(d["w"]), let h = num(d["h"]) else { return nil }
+    return CGRect(x: x, y: y, width: w, height: h)
   }
 
   /// Types that need a custom Core Image compositor (no AVFoundation ramp
@@ -81,6 +92,14 @@ class VideoExporter {
 
   private final class ProgressBox { var value = 0.0 }
 
+  /// Set from the main thread by "cancel", polled by the background text search.
+  private final class CancelFlag {
+    private let lock = NSLock()
+    private var flag = false
+    func set(_ v: Bool) { lock.lock(); flag = v; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
+  }
+
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     switch call.method {
     case "render":
@@ -98,10 +117,52 @@ class VideoExporter {
               let end = p["end"] as? Double else { return nil }
         return Piece(path: path, start: start, end: end,
                      cfAfter: (p["cfAfter"] as? Double) ?? 0,
-                     typeAfter: (p["type"] as? String) ?? "crossfade")
+                     typeAfter: (p["type"] as? String) ?? "crossfade",
+                     clipId: (p["clipId"] as? String) ?? "")
       }
       let settings = Settings(tier: (args["compression"] as? String) ?? "none")
-      render(pieces: pieces, output: output, settings: settings, result: result)
+      let blurs = (args["blurs"] as? [[String: Any]] ?? []).compactMap { BlurRegionData(dict: $0) }
+      render(pieces: pieces, blurs: blurs, output: output, settings: settings, result: result)
+    case "track":
+      guard let args = call.arguments as? [String: Any],
+            let path = args["path"] as? String,
+            let anchor = Self.num(args["anchor"]),
+            let rangeStart = Self.num(args["rangeStart"]),
+            let rangeEnd = Self.num(args["rangeEnd"]),
+            let rect = Self.normalizedRect(args["rect"]) else {
+        result(FlutterError(code: "bad_args", message: "Missing track arguments", details: nil))
+        return
+      }
+      track(path: path, anchor: anchor, rect: rect, rangeStart: rangeStart, rangeEnd: rangeEnd, result: result)
+    case "readText":
+      guard let args = call.arguments as? [String: Any],
+            let path = args["path"] as? String,
+            let time = Self.num(args["time"]),
+            let rect = Self.normalizedRect(args["rect"]) else {
+        result(FlutterError(code: "bad_args", message: "Missing readText arguments", details: nil))
+        return
+      }
+      readText(path: path, time: time, rect: rect, result: result)
+    case "findText":
+      guard let args = call.arguments as? [String: Any],
+            let path = args["path"] as? String,
+            let phrases = args["phrases"] as? [String],
+            let rangeStart = Self.num(args["rangeStart"]),
+            let rangeEnd = Self.num(args["rangeEnd"]) else {
+        result(FlutterError(code: "bad_args", message: "Missing findText arguments", details: nil))
+        return
+      }
+      findText(path: path, phrases: phrases, rangeStart: rangeStart, rangeEnd: rangeEnd, result: result)
+    case "blurPreview":
+      guard let args = call.arguments as? [String: Any],
+            let path = args["path"] as? String,
+            let time = Self.num(args["time"]),
+            let rect = Self.normalizedRect(args["rect"]) else {
+        result(FlutterError(code: "bad_args", message: "Missing preview arguments", details: nil))
+        return
+      }
+      blurPreview(path: path, time: time, rect: rect, style: (args["style"] as? String) ?? "pixelate",
+                  text: (args["text"] as? Bool) ?? false, result: result)
     case "remux":
       guard let args = call.arguments as? [String: Any],
             let input = args["input"] as? String,
@@ -125,6 +186,7 @@ class VideoExporter {
       }
       thumbnails(rawRequests, result: result)
     case "cancel":
+      cancelFlag.set(true)
       currentSession?.cancelExport()
       currentReader?.cancelReading()
       currentWriter?.cancelWriting()
@@ -134,16 +196,24 @@ class VideoExporter {
     }
   }
 
-  /// Return a file's duration in seconds (0 if unreadable). Uses AVFoundation
-  /// directly so we never spin up a video-player controller just to measure.
+  /// Return [duration seconds, display width, display height] (zeros if
+  /// unreadable). Uses AVFoundation directly so we never spin up a
+  /// video-player controller just to measure.
   private func probe(path: String, result: @escaping FlutterResult) {
     let asset = AVURLAsset(url: URL(fileURLWithPath: path))
-    asset.loadValuesAsynchronously(forKeys: ["duration"]) {
+    asset.loadValuesAsynchronously(forKeys: ["duration", "tracks"]) {
       var err: NSError?
       let status = asset.statusOfValue(forKey: "duration", error: &err)
       let secs = status == .loaded ? CMTimeGetSeconds(asset.duration) : 0
+      // Display size (after rotation), so the app can map a drawn box onto the frame.
+      var w = 0.0, h = 0.0
+      if let t = asset.tracks(withMediaType: .video).first {
+        let r = CGRect(origin: .zero, size: t.naturalSize).applying(t.preferredTransform)
+        w = Double(abs(r.width))
+        h = Double(abs(r.height))
+      }
       DispatchQueue.main.async {
-        result(secs.isFinite ? secs : 0.0)
+        result([secs.isFinite ? secs : 0.0, w, h])
       }
     }
   }
@@ -191,15 +261,20 @@ class VideoExporter {
     }
   }
 
-  private func render(pieces: [Piece], output: String, settings: Settings, result: @escaping FlutterResult) {
+  private func render(pieces: [Piece], blurs: [BlurRegionData], output: String, settings: Settings, result: @escaping FlutterResult) {
     let usable = pieces.filter { $0.length > 0 }
     if usable.isEmpty {
       result(FlutterError(code: "empty", message: "Nothing to render.", details: nil))
       return
     }
 
-    if usable.contains(where: { Self.customCompositorTypes.contains($0.typeAfter) }) {
-      renderCustom(pieces: usable, output: output, settings: settings, result: result)
+    // Blur boxes (and page curl / blinds) are drawn by the custom Core Image
+    // compositor; renders without either keep the plain AVFoundation path.
+    let hasBlur = usable.contains { pc in
+      blurs.contains { $0.clipId == pc.clipId && $0.end > pc.start && $0.start < pc.end }
+    }
+    if hasBlur || usable.contains(where: { Self.customCompositorTypes.contains($0.typeAfter) }) {
+      renderCustom(pieces: usable, blurs: blurs, output: output, settings: settings, result: result)
       return
     }
 
@@ -403,7 +478,7 @@ class VideoExporter {
   // slide/no-transition renders are completely unaffected and keep using the
   // already-verified AVFoundation-ramp implementation.
 
-  private func renderCustom(pieces: [Piece], output: String, settings: Settings, result: @escaping FlutterResult) {
+  private func renderCustom(pieces: [Piece], blurs: [BlurRegionData], output: String, settings: Settings, result: @escaping FlutterResult) {
     let composition = AVMutableComposition()
     guard
       let vA = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
@@ -418,7 +493,10 @@ class VideoExporter {
       composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid),
     ]
 
-    struct Placed { let track: Int; let start: CMTime; let dur: CMTime; let fit: CGAffineTransform; let typeAfter: String }
+    struct Placed {
+      let track: Int; let start: CMTime; let dur: CMTime; let fit: CGAffineTransform; let typeAfter: String
+      let srcStart: Double; let dispRect: CGRect; let regions: [BlurRegionData]
+    }
     var placed: [Placed] = []
     var overlaps: [Double] = []
     var renderSize = CGSize(width: 1280, height: 720)
@@ -458,7 +536,12 @@ class VideoExporter {
         return
       }
       let fit = Self.fitTransform(naturalSize: srcV.naturalSize, preferred: srcV.preferredTransform, render: renderSize)
-      placed.append(Placed(track: track, start: start, dur: CMTime(seconds: pc.length, preferredTimescale: 600), fit: fit, typeAfter: pc.typeAfter))
+      placed.append(Placed(
+        track: track, start: start, dur: CMTime(seconds: pc.length, preferredTimescale: 600), fit: fit,
+        typeAfter: pc.typeAfter, srcStart: pc.start,
+        // Where this clip's displayed frame lands in the canvas (top-left origin).
+        dispRect: CGRect(origin: .zero, size: srcV.naturalSize).applying(fit),
+        regions: blurs.filter { $0.clipId == pc.clipId && $0.end > pc.start && $0.start < pc.end }))
       cursor = start + CMTime(seconds: pc.length, preferredTimescale: 600)
       prevLen = pc.length
     }
@@ -475,9 +558,13 @@ class VideoExporter {
       let soloFrom = p.start + CMTime(seconds: headT, preferredTimescale: 600)
       let soloTo = p.start + p.dur - CMTime(seconds: tailT, preferredTimescale: 600)
       let trackID = vTracks[p.track].trackID
+      func info(_ q: Placed) -> SourceInfo {
+        SourceInfo(compStart: q.start, srcStart: q.srcStart, dispRect: q.dispRect, regions: q.regions)
+      }
       instructions.append(TransitionInstruction(
         timeRange: CMTimeRange(start: soloFrom, end: soloTo),
-        kind: .solo(track: trackID, fit: p.fit)))
+        kind: .solo(track: trackID, fit: p.fit),
+        sources: [trackID: info(p)]))
 
       if idx <= placed.count - 2 && overlaps[idx] > 0 {
         let next = placed[idx + 1]
@@ -486,7 +573,8 @@ class VideoExporter {
           timeRange: range,
           kind: .transition(type: p.typeAfter,
                              outTrack: vTracks[p.track].trackID, outFit: p.fit,
-                             inTrack: vTracks[next.track].trackID, inFit: next.fit)))
+                             inTrack: vTracks[next.track].trackID, inFit: next.fit),
+          sources: [vTracks[p.track].trackID: info(p), vTracks[next.track].trackID: info(next)]))
       }
     }
 
@@ -521,6 +609,478 @@ class VideoExporter {
       result: result)
   }
 
+  // MARK: - Blur text: read what's in a box, then find it everywhere
+
+  /// Lowercased letters and digits only (accents folded), remembering where each
+  /// kept character sat in the original string, so a match found on the
+  /// stripped text can be turned back into a range of the original.
+  private struct NormText {
+    var chars: [Character] = []
+    var origOffsets: [Int] = [] // offset, in Characters, into the original string
+  }
+
+  private static func normalize(_ s: String) -> NormText {
+    var n = NormText()
+    for (i, ch) in s.enumerated() {
+      let folded = String(ch).folding(options: [.diacriticInsensitive, .caseInsensitive], locale: nil)
+      for c in folded where c.isLetter || c.isNumber {
+        n.chars.append(c)
+        n.origOffsets.append(i)
+      }
+    }
+    return n
+  }
+
+  private static func editDistance(_ a: ArraySlice<Character>, _ b: [Character]) -> Int {
+    if a.isEmpty { return b.count }
+    if b.isEmpty { return a.count }
+    var prev = Array(0...b.count)
+    var cur = [Int](repeating: 0, count: b.count + 1)
+    for (i, ca) in a.enumerated() {
+      cur[0] = i + 1
+      for j in 0..<b.count {
+        cur[j + 1] = min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (ca == b[j] ? 0 : 1))
+      }
+      swap(&prev, &cur)
+    }
+    return prev[b.count]
+  }
+
+  /// How many characters of misreading to forgive for a phrase of this length.
+  private static func tolerance(_ length: Int) -> Int {
+    length <= 4 ? 0 : (length <= 9 ? 1 : (length <= 18 ? 2 : 3))
+  }
+
+  /// Non-overlapping places in `text` that match `query` to within `k` edits,
+  /// as ranges of normalized characters, best (fewest edits) first accepted.
+  private static func fuzzyMatches(in text: NormText, query: [Character], k: Int) -> [Range<Int>] {
+    let m = query.count, n = text.chars.count
+    guard m > 0, n >= max(1, m - k) else { return [] }
+    var candidates: [(dist: Int, start: Int, len: Int)] = []
+    for i in 0..<n {
+      var best: (dist: Int, len: Int)?
+      for len in max(1, m - k)...(m + k) where i + len <= n {
+        let d = editDistance(text.chars[i..<(i + len)], query)
+        if d <= k, best == nil || d < best!.dist || (d == best!.dist && abs(len - m) < abs(best!.len - m)) {
+          best = (d, len)
+        }
+      }
+      if let b = best { candidates.append((b.dist, i, b.len)) }
+    }
+    candidates.sort { ($0.dist, $0.start) < ($1.dist, $1.start) }
+    var accepted: [Range<Int>] = []
+    for c in candidates {
+      let r = c.start..<(c.start + c.len)
+      if !accepted.contains(where: { $0.overlaps(r) }) { accepted.append(r) }
+    }
+    return accepted.sorted { $0.lowerBound < $1.lowerBound }
+  }
+
+  /// Read the text inside `rect` (normalized, top-left origin) on the frame at
+  /// `time`: one string per line, top to bottom. The box is cropped and scaled
+  /// up first, which makes small text read much better.
+  private func readText(path: String, time: Double, rect: CGRect, result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      let gen = AVAssetImageGenerator(asset: AVURLAsset(url: URL(fileURLWithPath: path)))
+      gen.appliesPreferredTrackTransform = true
+      gen.requestedTimeToleranceBefore = .zero
+      gen.requestedTimeToleranceAfter = .zero
+      guard let cg = try? gen.copyCGImage(at: CMTime(seconds: max(0, time), preferredTimescale: 600), actualTime: nil) else {
+        DispatchQueue.main.async { result([String]()) }
+        return
+      }
+      let image = CIImage(cgImage: cg)
+      let w = CGFloat(cg.width), h = CGFloat(cg.height)
+      let box = CGRect(x: rect.minX * w, y: (1 - rect.maxY) * h, width: rect.width * w, height: rect.height * h)
+      let pad = 0.1 * max(box.width, box.height)
+      let crop = box.insetBy(dx: -pad, dy: -pad).intersection(image.extent).integral
+      guard !crop.isNull, crop.width >= 4, crop.height >= 4 else {
+        DispatchQueue.main.async { result([String]()) }
+        return
+      }
+      let up = min(4, max(1, 240 / crop.height))
+      let prepared = image.cropped(to: crop)
+        .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY)
+                       .concatenating(CGAffineTransform(scaleX: up, y: up)))
+      let req = VNRecognizeTextRequest()
+      req.recognitionLevel = .accurate
+      req.usesLanguageCorrection = false
+      try? VNImageRequestHandler(ciImage: prepared, options: [:]).perform([req])
+      let lines = (req.results ?? [])
+        .sorted { $0.boundingBox.midY > $1.boundingBox.midY } // top of the crop first
+        .compactMap { $0.topCandidates(1).first?.string.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+      DispatchQueue.main.async { result(lines) }
+    }
+  }
+
+  /// Read the text on frames of `[rangeStart, rangeEnd]` (8 a second) and, in
+  /// each, find every place any of `phrases` appears: ignoring capitals,
+  /// punctuation and spacing, and forgiving a few misread characters. Replies
+  /// with {hits: [[t, x, y, w, h, x, y, w, h, ...]], checked: N}: only frames
+  /// where something was found, boxes normalized, top-left origin. Reports
+  /// progress as it goes and stops early if "cancel" is called.
+  private func findText(path: String, phrases: [String], rangeStart: Double, rangeEnd: Double,
+                        result: @escaping FlutterResult) {
+    cancelFlag.set(false)
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self = self else { return }
+      func finish(_ value: Any?) { DispatchQueue.main.async { result(value) } }
+      let queries = phrases.map { Self.normalize($0).chars }.filter { !$0.isEmpty }
+      guard !queries.isEmpty else {
+        finish(FlutterError(code: "bad_args", message: "Type at least one phrase to look for.", details: nil))
+        return
+      }
+      let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+      guard let vt = asset.tracks(withMediaType: .video).first else {
+        finish(FlutterError(code: "find_failed", message: "This file has no video to search.", details: nil))
+        return
+      }
+      let shown = CGRect(origin: .zero, size: vt.naturalSize).applying(vt.preferredTransform)
+      let dw = abs(shown.width), dh = abs(shown.height)
+      guard dw > 0, dh > 0 else {
+        finish(FlutterError(code: "find_failed", message: "Couldn't read the video size.", details: nil))
+        return
+      }
+      // Upright frames, at most 1600 px on the long side (text needs the pixels).
+      let k = min(1.0, 1600.0 / max(dw, dh))
+      let render = CGSize(width: max(2, floor(dw * k / 2) * 2), height: max(2, floor(dh * k / 2) * 2))
+      let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+      layer.setTransform(Self.fitTransform(naturalSize: vt.naturalSize, preferred: vt.preferredTransform, render: render), at: .zero)
+      let instruction = AVMutableVideoCompositionInstruction()
+      instruction.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+      instruction.layerInstructions = [layer]
+      let comp = AVMutableVideoComposition()
+      comp.renderSize = render
+      let fps = vt.nominalFrameRate > 0 ? vt.nominalFrameRate.rounded() : 30
+      comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+      comp.instructions = [instruction]
+      let out = AVAssetReaderVideoCompositionOutput(
+        videoTracks: [vt],
+        videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA)])
+      out.videoComposition = comp
+      let reader: AVAssetReader
+      do {
+        reader = try AVAssetReader(asset: asset)
+        reader.timeRange = CMTimeRange(start: CMTime(seconds: max(0, rangeStart), preferredTimescale: 600),
+                                       end: CMTime(seconds: max(rangeStart, rangeEnd), preferredTimescale: 600))
+        guard reader.canAdd(out) else { throw NSError(domain: "Videoz", code: 1) }
+        reader.add(out)
+        guard reader.startReading() else { throw reader.error ?? NSError(domain: "Videoz", code: 2) }
+      } catch {
+        finish(FlutterError(code: "find_failed", message: "Couldn't read the video.", details: nil))
+        return
+      }
+
+      let step = 0.125
+      let span = max(0.001, rangeEnd - rangeStart)
+      var next = rangeStart
+      var checked = 0
+      var hits: [[Double]] = []
+      while let sb = out.copyNextSampleBuffer(), let pb = CMSampleBufferGetImageBuffer(sb) {
+        if self.cancelFlag.isSet {
+          reader.cancelReading()
+          finish(FlutterError(code: "cancelled", message: "Search cancelled.", details: nil))
+          return
+        }
+        let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+        if pts + 1e-6 < next { continue }
+        next = max(next + step, pts + step / 2)
+
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = false
+        req.minimumTextHeight = 0.004
+        try? VNImageRequestHandler(cvPixelBuffer: pb, options: [:]).perform([req])
+        checked += 1
+
+        var found: [CGRect] = []
+        for obs in req.results ?? [] {
+          guard let cand = obs.topCandidates(1).first else { continue }
+          let line = cand.string
+          let norm = Self.normalize(line)
+          for q in queries {
+            for r in Self.fuzzyMatches(in: norm, query: q, k: Self.tolerance(q.count)) {
+              let startOff = norm.origOffsets[r.lowerBound]
+              let endOff = norm.origOffsets[r.upperBound - 1] + 1
+              let lo = line.index(line.startIndex, offsetBy: startOff)
+              let hi = line.index(line.startIndex, offsetBy: min(endOff, line.count))
+              guard let bb = try? cand.boundingBox(for: lo..<hi)?.boundingBox else { continue }
+              found.append(CGRect(x: bb.minX, y: 1 - bb.maxY, width: bb.width, height: bb.height))
+            }
+          }
+        }
+        if !found.isEmpty {
+          var row: [Double] = [pts]
+          for f in found { row += [Double(f.minX), Double(f.minY), Double(f.width), Double(f.height)] }
+          hits.append(row)
+        }
+        let fraction = min(1, max(0, (pts - rangeStart) / span))
+        DispatchQueue.main.async { self.channel.invokeMethod("progress", arguments: fraction) }
+      }
+      reader.cancelReading()
+      finish(["hits": hits, "checked": checked])
+    }
+  }
+
+  // MARK: - Blur: tracking and preview
+
+  private struct TrackError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+  }
+
+  private struct TrackSample {
+    var t: Double
+    var rect: CGRect // normalized, top-left origin
+    var conf: Float
+  }
+
+  /// Follow the object in `rect` (normalized, top-left origin, on the frame at
+  /// `anchor`) forward to `rangeEnd` and backward to `rangeStart`, using
+  /// Vision's object tracker on upright, downscaled frames. Replies with
+  /// [[t, x, y, w, h, confidence]] in time order. Where confidence drops the box
+  /// is held at its last good position (and the low confidence is reported), so
+  /// the caller can flag the stretch instead of trusting a wandering box.
+  private func track(path: String, anchor: Double, rect: CGRect, rangeStart: Double, rangeEnd: Double,
+                     result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let samples = try Self.runTracking(path: path, anchor: anchor, box: rect,
+                                           rangeStart: rangeStart, rangeEnd: rangeEnd)
+        let out: [[Double]] = samples.map {
+          [$0.t, Double($0.rect.minX), Double($0.rect.minY), Double($0.rect.width), Double($0.rect.height), Double($0.conf)]
+        }
+        DispatchQueue.main.async { result(out) }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(code: "track_failed", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
+  }
+
+  private static func runTracking(path: String, anchor: Double, box: CGRect,
+                                  rangeStart: Double, rangeEnd: Double) throws -> [TrackSample] {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+    guard let vt = asset.tracks(withMediaType: .video).first else {
+      throw TrackError(message: "This file has no video to track.")
+    }
+    let natural = vt.naturalSize
+    let shown = CGRect(origin: .zero, size: natural).applying(vt.preferredTransform)
+    let dw = abs(shown.width), dh = abs(shown.height)
+    guard dw > 0, dh > 0 else { throw TrackError(message: "Couldn't read the video size.") }
+    let k = min(1.0, 960.0 / max(dw, dh))
+    let render = CGSize(width: max(2, floor(dw * k / 2) * 2), height: max(2, floor(dh * k / 2) * 2))
+    let fit = Self.fitTransform(naturalSize: natural, preferred: vt.preferredTransform, render: render)
+
+    // Upright frames (rotation applied), so Vision's boxes match what the user saw.
+    let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+    layer.setTransform(fit, at: .zero)
+    let instruction = AVMutableVideoCompositionInstruction()
+    instruction.timeRange = CMTimeRange(start: .zero, duration: asset.duration)
+    instruction.layerInstructions = [layer]
+    let comp = AVMutableVideoComposition()
+    comp.renderSize = render
+    let fps = vt.nominalFrameRate > 0 ? vt.nominalFrameRate.rounded() : 30
+    comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+    comp.instructions = [instruction]
+
+    func makeReader(_ from: Double, _ to: Double) throws -> (AVAssetReader, AVAssetReaderVideoCompositionOutput) {
+      let reader = try AVAssetReader(asset: asset)
+      reader.timeRange = CMTimeRange(start: CMTime(seconds: max(0, from), preferredTimescale: 600),
+                                     end: CMTime(seconds: max(from, to), preferredTimescale: 600))
+      let out = AVAssetReaderVideoCompositionOutput(
+        videoTracks: [vt],
+        videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA)])
+      out.videoComposition = comp
+      guard reader.canAdd(out) else { throw TrackError(message: "Couldn't read the video.") }
+      reader.add(out)
+      guard reader.startReading() else {
+        throw TrackError(message: reader.error?.localizedDescription ?? "Couldn't read the video.")
+      }
+      return (reader, out)
+    }
+
+    let start = CGRect(x: max(0, min(1, box.minX)), y: max(0, min(1, box.minY)),
+                       width: max(0.005, min(1, box.width)), height: max(0.005, min(1, box.height)))
+
+    /// Run the tracker over frames in the order `next` yields them.
+    func follow(_ next: () -> (CVPixelBuffer, Double)?) -> [TrackSample] {
+      var samples: [TrackSample] = []
+      let handler = VNSequenceRequestHandler()
+      // Vision wants bottom-left-origin boxes.
+      var obs = VNDetectedObjectObservation(
+        boundingBox: CGRect(x: start.minX, y: 1 - start.maxY, width: start.width, height: start.height))
+      var lastGood = start
+      var first = true
+      while let (pb, t) = next() {
+        let req = VNTrackObjectRequest(detectedObjectObservation: obs)
+        req.trackingLevel = .accurate
+        if first {
+          // The first frame establishes the object's appearance; report the
+          // user's own box for it.
+          try? handler.perform([req], on: pb)
+          if let r = req.results?.first as? VNDetectedObjectObservation { obs = r }
+          samples.append(TrackSample(t: t, rect: start, conf: 1))
+          first = false
+          continue
+        }
+        do { try handler.perform([req], on: pb) } catch {
+          samples.append(TrackSample(t: t, rect: lastGood, conf: 0))
+          continue
+        }
+        guard let r = req.results?.first as? VNDetectedObjectObservation else {
+          samples.append(TrackSample(t: t, rect: lastGood, conf: 0))
+          continue
+        }
+        obs = r // keep feeding it back so it can re-acquire after a dip
+        let bb = r.boundingBox
+        let tl = CGRect(x: max(0, bb.minX), y: max(0, 1 - bb.maxY),
+                        width: min(1, bb.width), height: min(1, bb.height))
+        if r.confidence >= 0.35 && tl.width > 0.003 && tl.height > 0.003 {
+          lastGood = tl
+          samples.append(TrackSample(t: t, rect: tl, conf: r.confidence))
+        } else {
+          samples.append(TrackSample(t: t, rect: lastGood, conf: r.confidence))
+        }
+      }
+      return samples
+    }
+
+    // Forward: anchor -> end.
+    var forward: [TrackSample] = []
+    if rangeEnd > anchor {
+      let (reader, out) = try makeReader(anchor, rangeEnd)
+      forward = follow {
+        guard let sb = out.copyNextSampleBuffer(), let pb = CMSampleBufferGetImageBuffer(sb) else { return nil }
+        return (pb, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb)))
+      }
+      reader.cancelReading()
+    } else {
+      // Anchor at the very end of the range: just the user's box.
+      forward = [TrackSample(t: anchor, rect: start, conf: 1)]
+    }
+
+    // Backward: read one second at a time (decoding only goes forward), then
+    // feed that chunk to the tracker in reverse. Starts again at the anchor frame.
+    var backward: [TrackSample] = []
+    if anchor > rangeStart {
+      var chunkEnd = anchor
+      var lastPTS = Double.infinity
+      var frames: [(CMSampleBuffer, Double)] = []
+      var pending: [(CMSampleBuffer, Double)] = [] // frames of the current chunk, newest first
+      var firstChunk = true
+      func nextBackward() -> (CVPixelBuffer, Double)? {
+        while pending.isEmpty {
+          guard chunkEnd > rangeStart + 1e-6 else { return nil }
+          let chunkStart = max(rangeStart, chunkEnd - 1.0)
+          guard let (reader, out) = try? makeReader(chunkStart, chunkEnd + (firstChunk ? 0.05 : 0)) else { return nil }
+          frames.removeAll()
+          while let sb = out.copyNextSampleBuffer() {
+            frames.append((sb, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))))
+          }
+          reader.cancelReading()
+          firstChunk = false
+          pending = frames.reversed().filter { $0.1 < lastPTS - 1e-4 }
+          chunkEnd = chunkStart
+          if chunkStart <= rangeStart + 1e-6 && pending.isEmpty { return nil }
+        }
+        let (sb, t) = pending.removeFirst()
+        lastPTS = t
+        guard let pb = CMSampleBufferGetImageBuffer(sb) else { return nextBackward() }
+        return (pb, t)
+      }
+      backward = follow(nextBackward)
+      if !backward.isEmpty { backward.removeFirst() } // that was the anchor frame again
+    }
+
+    var all = backward.reversed() + forward
+    all.sort { $0.t < $1.t }
+    guard !all.isEmpty else { throw TrackError(message: "No frames were read in that range.") }
+
+    // Light smoothing (5-frame average) so the box doesn't jitter.
+    var smooth = all
+    for i in all.indices {
+      let lo = max(0, i - 2), hi = min(all.count - 1, i + 2)
+      var x = 0.0, y = 0.0, w = 0.0, h = 0.0
+      for j in lo...hi {
+        x += Double(all[j].rect.minX); y += Double(all[j].rect.minY)
+        w += Double(all[j].rect.width); h += Double(all[j].rect.height)
+      }
+      let n = Double(hi - lo + 1)
+      smooth[i].rect = CGRect(x: x / n, y: y / n, width: w / n, height: h / n)
+    }
+    // The tracker can shrink onto the most distinctive part of an object (a
+    // rotating rocket's thin side view, say), and a box that's too small leaks.
+    // But an object that is really getting smaller (the camera zooming out, a
+    // person walking away) should get a smaller box. The difference is speed: a
+    // real zoom-out shrinks gradually, a wobble drops fast. So the box may shrink
+    // only as fast as the biggest it was within the last and next 0.6 s allows
+    // (never below 80% of that), and never under a quarter of what the user drew.
+    let half = Int(max(1, (Double(fps) * 0.6).rounded()))
+    let hardMinW = start.width * 0.25, hardMinH = start.height * 0.25
+    let sizes = smooth.map { ($0.rect.width, $0.rect.height) }
+    for i in smooth.indices {
+      let lo = max(0, i - half), hi = min(smooth.count - 1, i + half)
+      var maxW: CGFloat = 0, maxH: CGFloat = 0
+      for j in lo...hi {
+        maxW = max(maxW, sizes[j].0)
+        maxH = max(maxH, sizes[j].1)
+      }
+      let minW = max(hardMinW, 0.8 * maxW), minH = max(hardMinH, 0.8 * maxH)
+      var r = smooth[i].rect
+      if r.width < minW { r = CGRect(x: r.midX - minW / 2, y: r.minY, width: minW, height: r.height) }
+      if r.height < minH { r = CGRect(x: r.minX, y: r.midY - minH / 2, width: r.width, height: minH) }
+      r.origin.x = max(0, min(1 - r.width, r.minX))
+      r.origin.y = max(0, min(1 - r.height, r.minY))
+      smooth[i].rect = r
+    }
+    return smooth
+  }
+
+  /// Three small JPEGs (fine, medium, coarse) of the box in the given style, on
+  /// the frame at `time`, so the user can pick a look by looking at it.
+  private func blurPreview(path: String, time: Double, rect: CGRect, style: String, text: Bool = false,
+                           result: @escaping FlutterResult) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      let none: [Any] = [NSNull(), NSNull(), NSNull()]
+      let gen = AVAssetImageGenerator(asset: AVURLAsset(url: URL(fileURLWithPath: path)))
+      gen.appliesPreferredTrackTransform = true
+      gen.maximumSize = CGSize(width: 1920, height: 1920)
+      gen.requestedTimeToleranceBefore = .zero
+      gen.requestedTimeToleranceAfter = .zero
+      guard let cg = try? gen.copyCGImage(at: CMTime(seconds: max(0, time), preferredTimescale: 600), actualTime: nil) else {
+        DispatchQueue.main.async { result(none) }
+        return
+      }
+      let image = CIImage(cgImage: cg)
+      let w = CGFloat(cg.width), h = CGFloat(cg.height)
+      let box = CGRect(x: rect.minX * w, y: (1 - rect.maxY) * h, width: rect.width * w, height: rect.height * h)
+      let crop = paddedBox(box, extent: image.extent, text: text)
+      let ctx = CIContext()
+      var out: [Any] = []
+      for scale in ["fine", "medium", "coarse"] {
+        guard !crop.isNull, crop.width >= 2, crop.height >= 2 else { out.append(NSNull()); continue }
+        let k = min(1, 260 / crop.width)
+        let shown = applyBlur(image, box: box, style: style, scale: scale, text: text)
+          .cropped(to: crop)
+          .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY)
+                         .concatenating(CGAffineTransform(scaleX: k, y: k)))
+        guard let rendered = ctx.createCGImage(shown, from: shown.extent) else { out.append(NSNull()); continue }
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
+          out.append(NSNull())
+          continue
+        }
+        CGImageDestinationAddImage(dest, rendered, [kCGImageDestinationLossyCompressionQuality as String: 0.85] as CFDictionary)
+        CGImageDestinationFinalize(dest)
+        out.append(FlutterStandardTypedData(bytes: data as Data))
+      }
+      DispatchQueue.main.async { result(out) }
+    }
+  }
+
   // MARK: - Export back ends
 
   private func runExport(
@@ -532,6 +1092,15 @@ class VideoExporter {
     frameRate: Int32,
     result: @escaping FlutterResult
   ) {
+    // An audio track nothing was placed on (a silent clip, or an A/B track one
+    // clip never used) makes AVAssetExportSession stop with "Operation Stopped".
+    // Drop those, and any mix parameters that point at them.
+    for t in composition.tracks(withMediaType: .audio) where t.segments.isEmpty {
+      composition.removeTrack(t)
+    }
+    let liveAudio = Set(composition.tracks(withMediaType: .audio).map { $0.trackID })
+    audioMix.inputParameters = audioMix.inputParameters.filter { liveAudio.contains($0.trackID) }
+
     if settings.isCompressed {
       exportWithWriter(
         composition: composition, videoComposition: videoComposition, audioMix: audioMix,
@@ -800,10 +1369,13 @@ private final class TransitionInstruction: NSObject, AVVideoCompositionInstructi
   var requiredSourceTrackIDs: [NSValue]?
   var passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
   let kind: Kind
+  /// Per source track: where its frames sit in time and the blur boxes to draw.
+  let sources: [CMPersistentTrackID: SourceInfo]
 
-  init(timeRange: CMTimeRange, kind: Kind) {
+  init(timeRange: CMTimeRange, kind: Kind, sources: [CMPersistentTrackID: SourceInfo] = [:]) {
     self.timeRange = timeRange
     self.kind = kind
+    self.sources = sources
     switch kind {
     case .solo(let track, _):
       requiredSourceTrackIDs = [NSNumber(value: track)]
@@ -850,8 +1422,31 @@ private final class TransitionCompositor: NSObject, AVVideoCompositing {
 
     func fitted(_ trackID: CMPersistentTrackID, _ fit: CGAffineTransform) -> CIImage {
       guard let buf = request.sourceFrame(byTrackID: trackID) else { return black }
-      let img = CIImage(cvPixelBuffer: buf).transformed(by: fit)
-      return img.composited(over: black).cropped(to: extent)
+      // `fit` is in AVFoundation's video space (origin top-left, y down); Core
+      // Image is y up. Conjugate with a vertical flip on each side, otherwise
+      // rotated clips (phone video) come out upside down.
+      let bufH = CGFloat(CVPixelBufferGetHeight(buf))
+      let flipIn = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: bufH)
+      let flipOut = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: renderSize.height)
+      var img = CIImage(cvPixelBuffer: buf)
+        .transformed(by: flipIn.concatenating(fit).concatenating(flipOut))
+        .composited(over: black)
+        .cropped(to: extent)
+      if let info = instruction.sources[trackID], !info.regions.isEmpty {
+        let srcTime = info.srcStart + (request.compositionTime - info.compStart).seconds
+        for region in info.regions {
+          for n in region.rects(at: srcTime) {
+            let d = info.dispRect
+            let box = CGRect(
+              x: d.minX + n.minX * d.width,
+              y: renderSize.height - (d.minY + (n.minY + n.height) * d.height),
+              width: n.width * d.width,
+              height: n.height * d.height)
+            img = applyBlur(img, box: box, style: region.style, scale: region.scale, text: region.isText)
+          }
+        }
+      }
+      return img
     }
 
     let output: CIImage
@@ -971,4 +1566,246 @@ private final class TransitionCompositor: NSObject, AVVideoCompositing {
       return outFaded.composited(over: incoming)
     }
   }
+}
+
+/// Where one source track's frames sit in time, and the blur boxes that apply.
+private struct SourceInfo {
+  let compStart: CMTime // composition time at which this piece starts
+  let srcStart: Double // clip time (seconds) of that first frame
+  let dispRect: CGRect // the clip's displayed frame inside the canvas, top-left origin
+  let regions: [BlurRegionData]
+}
+
+/// One blur region from the app, over a clip-time range. Either an object: one
+/// tracked box (normalized to the clip's displayed frame, top-left origin) per
+/// sample time. Or text: for each stretch of time, the boxes of every place the
+/// searched text was found (there can be several per frame).
+private final class BlurRegionData {
+  let clipId: String
+  let start: Double
+  let end: Double
+  let scale: String // "fine" | "medium" | "coarse"
+  let style: String // "pixelate" | "blur" | "box" | "fill"
+  private let times: [Double]
+  private let rects: [CGRect]
+  private let entries: [(a: Double, b: Double, rects: [CGRect])]
+  let isText: Bool
+
+  init?(dict: [String: Any]) {
+    func numbers(_ any: Any?) -> [Double]? { (any as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue } }
+    guard let clipId = dict["clipId"] as? String,
+          let start = (dict["start"] as? NSNumber)?.doubleValue,
+          let end = (dict["end"] as? NSNumber)?.doubleValue
+    else { return nil }
+    self.clipId = clipId
+    self.start = start
+    self.end = end
+    self.scale = (dict["scale"] as? String) ?? "medium"
+    self.style = (dict["style"] as? String) ?? "pixelate"
+    func quads(_ flat: ArraySlice<Double>) -> [CGRect] {
+      var out: [CGRect] = []
+      var i = flat.startIndex
+      while i + 3 < flat.endIndex {
+        out.append(CGRect(x: flat[i], y: flat[i + 1], width: flat[i + 2], height: flat[i + 3]))
+        i += 4
+      }
+      return out
+    }
+    if let raw = dict["entries"] as? [Any] {
+      // Text: each entry is [from, to, x, y, w, h, x, y, w, h, ...].
+      var list: [(a: Double, b: Double, rects: [CGRect])] = []
+      for e in raw {
+        guard let n = numbers(e), n.count >= 6 else { continue }
+        list.append((a: n[0], b: n[1], rects: quads(n[2...])))
+      }
+      guard !list.isEmpty else { return nil }
+      isText = true
+      entries = list
+      times = []
+      rects = []
+    } else {
+      guard let flat = numbers(dict["samples"]), flat.count >= 5 else { return nil }
+      var t: [Double] = []
+      var r: [CGRect] = []
+      var i = 0
+      while i + 4 < flat.count {
+        t.append(flat[i])
+        r.append(CGRect(x: flat[i + 1], y: flat[i + 2], width: flat[i + 3], height: flat[i + 4]))
+        i += 5
+      }
+      isText = false
+      times = t
+      rects = r
+      entries = []
+    }
+  }
+
+  /// The boxes to pixelate at clip time `t`: for an object, its one box
+  /// (interpolated between samples, held at the ends); for text, every box from
+  /// every stretch that covers `t`. Empty outside the region's own range.
+  func rects(at t: Double) -> [CGRect] {
+    guard t >= start - 0.001, t <= end + 0.001 else { return [] }
+    if isText {
+      var out: [CGRect] = []
+      for e in entries where t >= e.a - 1e-6 && t <= e.b + 1e-6 { out += e.rects }
+      return out
+    }
+    guard !times.isEmpty else { return [] }
+    if t <= times[0] { return [rects[0]] }
+    if t >= times[times.count - 1] { return [rects[rects.count - 1]] }
+    var lo = 0, hi = times.count - 1
+    while hi - lo > 1 {
+      let mid = (lo + hi) / 2
+      if times[mid] <= t { lo = mid } else { hi = mid }
+    }
+    let f = CGFloat((t - times[lo]) / max(1e-9, times[hi] - times[lo]))
+    let a = rects[lo], b = rects[hi]
+    return [CGRect(x: a.minX + (b.minX - a.minX) * f, y: a.minY + (b.minY - a.minY) * f,
+                   width: a.width + (b.width - a.width) * f, height: a.height + (b.height - a.height) * f)]
+  }
+}
+
+/// The area actually pixelated for a tracked box: grown by 20% on every side
+/// (and at least 1.2% of the frame's short side), because a tracker that is a
+/// little small or off should still hide the target, not leave an edge of it.
+///
+/// For text the boxes are already tight around the letters, and a phrase can be
+/// long, so growing by a fifth of its width would eat neighbouring words:
+/// there it grows by a third of the text's height all round instead.
+private func paddedBox(_ box: CGRect, extent: CGRect, text: Bool = false) -> CGRect {
+  let floorPad = 0.012 * min(extent.width, extent.height)
+  let padX = text ? max(0.33 * box.height, floorPad) : max(0.20 * box.width, floorPad)
+  let padY = text ? max(0.33 * box.height, floorPad) : max(0.20 * box.height, floorPad)
+  return box.insetBy(dx: -padX, dy: -padY).intersection(extent).integral
+}
+
+/// Pixelate `box` (Core Image coordinates, y up) inside `image`. The block size
+/// is relative to the padded box, so a small face and a wide banner look alike.
+private func pixelateBox(_ image: CIImage, box: CGRect, scale: String, text: Bool = false) -> CIImage {
+  let padded = paddedBox(box, extent: image.extent, text: text)
+  guard !padded.isNull, padded.width >= 2, padded.height >= 2 else { return image }
+  let across: CGFloat
+  switch scale {
+  case "fine": across = 10
+  case "coarse": across = 3
+  default: across = 6
+  }
+  let block = max(3, min(padded.width, padded.height) / across)
+  guard let f = CIFilter(name: "CIPixellate") else { return image }
+  f.setValue(image.cropped(to: padded), forKey: kCIInputImageKey)
+  f.setValue(CIVector(x: padded.minX, y: padded.minY), forKey: kCIInputCenterKey)
+  f.setValue(block, forKey: kCIInputScaleKey)
+  guard let out = f.outputImage else { return image }
+  return out.cropped(to: padded).composited(over: image)
+}
+
+/// Draw the chosen look over `box` (Core Image coordinates, y up).
+private func applyBlur(_ image: CIImage, box: CGRect, style: String, scale: String, text: Bool) -> CIImage {
+  switch style {
+  case "blur": return frostedBlur(image, box: box, scale: scale, text: text)
+  case "fill": return backgroundFill(image, box: box, text: text)
+  case "box":
+    let padded = paddedBox(box, extent: image.extent, text: text)
+    guard !padded.isNull, padded.width >= 2, padded.height >= 2 else { return image }
+    return CIImage(color: .black).cropped(to: padded).composited(over: image)
+  default: return pixelateBox(image, box: box, scale: scale, text: text)
+  }
+}
+
+/// A smooth, cloudy blur whose edge fades out instead of ending in a hard
+/// rectangle. The fully-blurred core is the padded box grown by half the fade, so
+/// the target itself is never in the thin part of the fade.
+private func frostedBlur(_ image: CIImage, box: CGRect, scale: String, text: Bool) -> CIImage {
+  let padded = paddedBox(box, extent: image.extent, text: text)
+  guard !padded.isNull, padded.width >= 2, padded.height >= 2 else { return image }
+  let short = min(padded.width, padded.height)
+  let feather = max(4, 0.15 * short)
+  let core = padded.insetBy(dx: -0.5 * feather, dy: -0.5 * feather)
+  let outer = core.insetBy(dx: -1.2 * feather, dy: -1.2 * feather).intersection(image.extent).integral
+  guard !outer.isNull, outer.width >= 2, outer.height >= 2 else { return image }
+
+  // Light / Medium / Heavy. Text is the hard case: the blur has to be a good
+  // fraction of the letters' height before it stops being readable.
+  let blurDivisor: CGFloat = scale == "fine" ? 5 : (scale == "coarse" ? 2.5 : 3.5)
+  let sigma = max(2, short / blurDivisor)
+
+  let softened = image.clampedToExtent()
+    .applyingGaussianBlur(sigma: Double(sigma))
+    .cropped(to: outer)
+
+  // White core fading to black, as an opaque grayscale mask.
+  let mask = CIImage(color: .white)
+    .cropped(to: core.intersection(outer))
+    .composited(over: CIImage(color: .black).cropped(to: outer))
+    .clampedToExtent()
+    .applyingGaussianBlur(sigma: Double(feather / 2.5))
+    .cropped(to: outer)
+  return softened
+    .applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: image, kCIInputMaskImageKey: mask])
+    .cropped(to: image.extent)
+}
+
+/// "White out": cover the box with the color of what surrounds it, so text on a
+/// plain or gently shaded background all but disappears. The colors are the
+/// average of a thin strip just outside each side of the box; the fill blends the
+/// left strip into the right (and top into bottom) and averages the two, so a
+/// background that changes across the box is followed. The edge is feathered a
+/// little. Everything happens in the Core Image graph, with no readback.
+private func backgroundFill(_ image: CIImage, box: CGRect, text: Bool) -> CIImage {
+  let padded = paddedBox(box, extent: image.extent, text: text)
+  guard !padded.isNull, padded.width >= 2, padded.height >= 2 else { return image }
+  let short = min(padded.width, padded.height)
+  let feather = max(3, 0.08 * short)
+  let core = padded.insetBy(dx: -0.5 * feather, dy: -0.5 * feather)
+  let outer = core.insetBy(dx: -1.2 * feather, dy: -1.2 * feather).intersection(image.extent).integral
+  guard !outer.isNull, outer.width >= 2, outer.height >= 2 else { return image }
+
+  // A flat color (as an endless image) from the average of a strip, if it's on screen.
+  let thick = max(2, 0.08 * short)
+  func side(_ strip: CGRect) -> CIImage? {
+    let r = strip.intersection(image.extent).integral
+    guard !r.isNull, r.width >= 1, r.height >= 1 else { return nil }
+    return image.cropped(to: r)
+      .applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: r)])
+      .clampedToExtent()
+  }
+  let left = side(CGRect(x: core.minX - thick - 1, y: core.minY, width: thick, height: core.height))
+  let right = side(CGRect(x: core.maxX + 1, y: core.minY, width: thick, height: core.height))
+  let bottom = side(CGRect(x: core.minX, y: core.minY - thick - 1, width: core.width, height: thick))
+  let top = side(CGRect(x: core.minX, y: core.maxY + 1, width: core.width, height: thick))
+  // Use the opposite side where one is off the edge of the picture.
+  let l = left ?? right ?? top ?? bottom, r = right ?? left ?? top ?? bottom
+  let t = top ?? bottom ?? left ?? right, b = bottom ?? top ?? left ?? right
+  guard let l = l, let r = r, let t = t, let b = b else {
+    return CIImage(color: .black).cropped(to: padded).composited(over: image)
+  }
+
+  func ramp(from: CGPoint, to: CGPoint) -> CIImage {
+    CIFilter(name: "CILinearGradient", parameters: [
+      "inputPoint0": CIVector(cgPoint: from), "inputPoint1": CIVector(cgPoint: to),
+      "inputColor0": CIColor(red: 1, green: 1, blue: 1, alpha: 1),
+      "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 1),
+    ])!.outputImage!.cropped(to: outer)
+  }
+  let horizontal = l.cropped(to: outer).applyingFilter("CIBlendWithMask", parameters: [
+    kCIInputBackgroundImageKey: r.cropped(to: outer),
+    kCIInputMaskImageKey: ramp(from: CGPoint(x: core.minX, y: 0), to: CGPoint(x: core.maxX, y: 0)),
+  ])
+  let vertical = t.cropped(to: outer).applyingFilter("CIBlendWithMask", parameters: [
+    kCIInputBackgroundImageKey: b.cropped(to: outer),
+    kCIInputMaskImageKey: ramp(from: CGPoint(x: 0, y: core.maxY), to: CGPoint(x: 0, y: core.minY)),
+  ])
+  let fill = horizontal
+    .applyingFilter("CIDissolveTransition", parameters: [kCIInputTargetImageKey: vertical, kCIInputTimeKey: 0.5])
+    .cropped(to: outer)
+
+  let mask = CIImage(color: .white)
+    .cropped(to: core.intersection(outer))
+    .composited(over: CIImage(color: .black).cropped(to: outer))
+    .clampedToExtent()
+    .applyingGaussianBlur(sigma: Double(feather / 2.5))
+    .cropped(to: outer)
+  return fill
+    .applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: image, kCIInputMaskImageKey: mask])
+    .cropped(to: image.extent)
 }

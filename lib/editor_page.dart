@@ -2,9 +2,13 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show LogicalKeyboardKey;
 import 'package:path/path.dart' as p;
 import 'package:video_player/video_player.dart';
 
+import 'blur_dialog.dart';
+import 'blur_overlay.dart';
+import 'blur_region.dart';
 import 'clip.dart';
 import 'editor_model.dart';
 import 'export_dialog.dart';
@@ -24,6 +28,10 @@ class _EditorPageState extends State<EditorPage> {
   final ExportService _exporter = ExportService();
 
   final List<Clip> _clips = [];
+  final List<BlurRegion> _blurs = [];
+  _BlurDraw? _draw; // set while the user is drawing (or fixing) a blur box
+  BlurLook _lastLook = const BlurLook(BlurStyle.pixelate, PixelScale.medium);
+  bool _searching = false; // a text search is running (and can be cancelled)
   VideoPlayerController? _video;
   String? _previewTemp;
 
@@ -82,14 +90,18 @@ class _EditorPageState extends State<EditorPage> {
     for (final f in result.files) {
       final path = f.path;
       if (path == null) continue;
-      _clips.add(Clip(path: path, duration: await _exporter.probeDuration(path)));
+      final info = await _exporter.probeInfo(path);
+      _clips.add(Clip(path: path, duration: info.duration, displaySize: info.size));
     }
     _resetTimelineForClips();
     await _requestRender();
   }
 
   void _removeClip(Clip clip) {
-    setState(() => _clips.removeWhere((c) => c.id == clip.id));
+    setState(() {
+      _clips.removeWhere((c) => c.id == clip.id);
+      _blurs.removeWhere((b) => b.clipId == clip.id);
+    });
     _resetTimelineForClips();
     _requestRender();
   }
@@ -167,6 +179,7 @@ class _EditorPageState extends State<EditorPage> {
           end: subs[j].inEnd.inMicroseconds / 1e6,
           crossfade: active ? t.duration.inMicroseconds / 1e6 : 0.0,
           type: active ? t.type.wire : 'none',
+          clipId: _clips[subs[j].clip].id.toString(),
         ));
       }
     }
@@ -178,6 +191,8 @@ class _EditorPageState extends State<EditorPage> {
   /// True when the current edit is just a single whole clip — no combine/cut/
   /// fade needed, so we can play the original file directly (no re-encode).
   bool get _isTrivialSingleClip {
+    // Blurred video must be re-rendered; copying the file would keep the original pixels.
+    if (_blurs.isNotEmpty) return false;
     if (_clips.length != 1) return false;
     final kept = _model.keptSegments;
     if (kept.length != 1) return false;
@@ -232,6 +247,7 @@ class _EditorPageState extends State<EditorPage> {
         await _exporter.render(
           pieces: _buildPieces(),
           outputPath: newTemp,
+          blurs: _blurs,
           onProgress: (pr) {
             if (mounted) {
               setState(() => _status = 'Rendering preview… ${(pr * 100).round()}%');
@@ -385,6 +401,32 @@ class _EditorPageState extends State<EditorPage> {
       return;
     }
 
+    final unsure = _blurs.where((b) => b.unsureSpans.isNotEmpty).length;
+    if (unsure > 0) {
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Check the red stretches first'),
+          content: Text(
+            unsure == 1
+                ? 'One blur has a stretch (red on the timeline) where the tracker lost '
+                    'what it was following. There the box stays at its last known spot, so '
+                    'the object may show. Scrub through it, and use right-click, "Fix box '
+                    'on this frame", where it is off.'
+                : '$unsure blurs have stretches (red on the timeline) where the tracker '
+                    'lost what it was following. There the box stays at its last known '
+                    'spot, so the object may show. Scrub through them, and use right-click, '
+                    '"Fix box on this frame", where a box is off.',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Go back')),
+            FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Export anyway')),
+          ],
+        ),
+      );
+      if (go != true || !mounted) return;
+    }
+
     // One whole clip with no cuts or transitions: "no compression" can convert
     // by copying the video into the new container instead of re-encoding it.
     final convertOnly = _isTrivialSingleClip;
@@ -444,6 +486,7 @@ class _EditorPageState extends State<EditorPage> {
           pieces: _buildPieces(),
           outputPath: outPath,
           compression: settings.compression,
+          blurs: _blurs,
           onProgress: onProgress,
         );
       }
@@ -480,9 +523,436 @@ class _EditorPageState extends State<EditorPage> {
       size = ' (${_fmtSize(File(path).lengthSync())})';
     } catch (_) {}
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('Wrote ${p.basename(path)}$size'),
-      duration: const Duration(seconds: 6),
+      content: Text('Wrote ${p.basename(path)}$size'
+          '${_blurs.isEmpty ? '' : '. Watch the blurred parts through before sharing it.'}'),
+      duration: const Duration(seconds: 8),
     ));
+  }
+
+  // ---------- Blur ----------
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Clip? _clipAt(Duration source) {
+    if (_clips.isEmpty) return null;
+    final starts = _clipStarts;
+    for (var i = 0; i < _clips.length; i++) {
+      if (source < starts[i] + _clips[i].duration) return _clips[i];
+    }
+    return _clips.last;
+  }
+
+  Duration _clipStart(Clip clip) {
+    final i = _clips.indexWhere((c) => c.id == clip.id);
+    return i < 0 ? Duration.zero : _clipStarts[i];
+  }
+
+  double _localSeconds(Clip clip, Duration source) =>
+      (source - _clipStart(clip)).inMicroseconds / 1e6;
+
+  /// Maps between the preview canvas and a clip's own frame; null until the
+  /// preview is loaded and the clip's size is known.
+  FrameMapper? _mapperFor(Clip clip) {
+    final v = _video;
+    final size = clip.displaySize;
+    if (v == null || !v.value.isInitialized || size == null) return null;
+    final canvas = v.value.size;
+    if (canvas.width <= 0 || canvas.height <= 0) return null;
+    return FrameMapper(canvas: canvas, clip: size);
+  }
+
+  /// Begin a new blur: the stretch between the two marks around the playhead is
+  /// the range, and the box is drawn on the frame showing now.
+  Future<void> _startBlur({bool text = false}) async {
+    final v = _video;
+    if (v == null || !v.value.isInitialized || _draw != null) return;
+    await v.pause();
+    final t = _playhead;
+    Segment? seg;
+    for (final s in _model.segments) {
+      if (t >= s.start && t < s.end) {
+        seg = s;
+        break;
+      }
+    }
+    seg ??= _model.segments.isEmpty ? null : _model.segments.last;
+    if (seg == null) return;
+    if (seg.removed) {
+      _snack('That part is X\'d out. Move the playhead into a kept segment first.');
+      return;
+    }
+    final clip = _clipAt(seg.start);
+    if (clip == null || clip.displaySize == null) {
+      _snack('This file has no video to blur.');
+      return;
+    }
+    final clipStart = _clipStart(clip);
+    final startLocal = (seg.start - clipStart).inMicroseconds / 1e6;
+    final endLocal = (seg.end - clipStart).inMicroseconds / 1e6;
+    final anchor = _localSeconds(clip, t).clamp(startLocal, endLocal).toDouble();
+    setState(() => _draw = _BlurDraw(
+          clip: clip, anchor: anchor, rangeStart: startLocal, rangeEnd: endLocal, text: text));
+  }
+
+  /// Re-draw one blur's box on the frame showing now (after a right-click).
+  Future<void> _startFix(BlurRegion r) async {
+    final v = _video;
+    if (v == null || !v.value.isInitialized || _draw != null) return;
+    await v.pause();
+    final clip = _clipAt(_playhead);
+    final local = clip == null ? 0.0 : _localSeconds(clip, _playhead);
+    if (clip == null || clip.id != r.clipId || !r.contains(local)) {
+      _snack('Move the playhead onto a frame where this blur is active, then try again.');
+      return;
+    }
+    setState(() => _draw = _BlurDraw(
+          clip: clip,
+          anchor: local.clamp(r.start, r.end).toDouble(),
+          rangeStart: r.start,
+          rangeEnd: r.end,
+          fixing: r));
+  }
+
+  void _cancelDraw() {
+    if (_draw != null) setState(() => _draw = null);
+  }
+
+  Future<void> _onBoxDrawn(Rect canvasNorm) async {
+    final d = _draw;
+    if (d == null) return;
+    final mapper = _mapperFor(d.clip);
+    if (mapper == null) {
+      _cancelDraw();
+      return;
+    }
+    final box = mapper.canvasToClip(canvasNorm);
+    if (box.width < 0.01 || box.height < 0.01) return; // a stray click, not a box
+    if (d.text) {
+      await _textBoxDrawn(d, box);
+      return;
+    }
+    if (d.fixing != null) {
+      await _applyFix(d, box);
+      return;
+    }
+    final look = await showDialog<BlurLook>(
+      context: context,
+      builder: (_) => BlurScaleDialog(
+        exporter: _exporter,
+        path: d.clip.path,
+        time: d.anchor,
+        rect: box,
+        initial: _lastLook,
+      ),
+    );
+    // Back (or clicking away) keeps drawing mode on so the box can be redone;
+    // the banner's Cancel or Esc is what leaves it.
+    if (look == null) return;
+    _lastLook = look;
+    await _trackNew(d, box, look);
+  }
+
+  /// A box was drawn around some text: confirm what it says and how pixelated,
+  /// then search the marked stretch for every place it appears.
+  Future<void> _textBoxDrawn(_BlurDraw d, Rect box) async {
+    final choice = await showDialog<TextBlurChoice>(
+      context: context,
+      builder: (_) => TextBlurDialog(
+        exporter: _exporter,
+        path: d.clip.path,
+        time: d.anchor,
+        rect: box,
+        initial: _lastLook,
+      ),
+    );
+    if (choice == null) return; // Back: stay in drawing mode
+    _lastLook = choice.look;
+    await _searchText(d, box, choice);
+  }
+
+  Future<void> _searchText(_BlurDraw d, Rect box, TextBlurChoice choice) async {
+    setState(() {
+      _draw = null;
+      _busy = true;
+      _searching = true;
+      _status = 'Searching for the text… 0%';
+    });
+    try {
+      final found = await _exporter.findText(
+        path: d.clip.path,
+        phrases: choice.phrases,
+        rangeStart: d.rangeStart,
+        rangeEnd: d.rangeEnd,
+        onProgress: (pr) {
+          if (mounted) setState(() => _status = 'Searching for the text… ${(pr * 100).round()}%');
+        },
+      );
+      if (found.hits.isEmpty) {
+        _showError('That text wasn\'t found in any of the ${found.checked} frames read, so '
+            'nothing was blurred. Check the spelling in the box, or pick a stretch where it '
+            'is clearly on screen.');
+      } else {
+        // The frame you drew on is always covered, even if the reader missed it there.
+        final hits = [...found.hits, TextHit(t: d.anchor, rects: [box])]
+          ..sort((a, b) => a.t.compareTo(b.t));
+        final region = BlurRegion(
+          id: BlurRegion.nextId(),
+          clipId: d.clip.id,
+          start: d.rangeStart,
+          end: d.rangeEnd,
+          scale: choice.look.scale,
+          style: choice.look.style,
+          samples: const [],
+          anchors: [d.anchor],
+          kind: BlurKind.text,
+          hits: hits,
+          phrases: choice.phrases,
+          checked: found.checked,
+        );
+        if (mounted) setState(() => _blurs.add(region));
+        _snack('Found it in ${found.hits.length} of ${found.checked} frames read. Watch the '
+            'stretch through: the bar under the timeline is solid where text was blurred.');
+      }
+    } on ExportException catch (e) {
+      if (e.code != 'cancelled') _showError('Couldn\'t search for that text:\n${e.message}');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _searching = false;
+          _status = null;
+        });
+      }
+    }
+    _requestRender();
+  }
+
+  Future<void> _trackNew(_BlurDraw d, Rect box, BlurLook look) async {
+    setState(() {
+      _draw = null;
+      _busy = true;
+      _status = 'Tracking…';
+    });
+    try {
+      final samples = await _exporter.track(
+        path: d.clip.path,
+        anchor: d.anchor,
+        rect: box,
+        rangeStart: d.rangeStart,
+        rangeEnd: d.rangeEnd,
+      );
+      final region = BlurRegion(
+        id: BlurRegion.nextId(),
+        clipId: d.clip.id,
+        start: d.rangeStart,
+        end: d.rangeEnd,
+        scale: look.scale,
+        style: look.style,
+        samples: samples,
+        anchors: [d.anchor],
+      );
+      if (mounted) setState(() => _blurs.add(region));
+      if (region.unsureSpans.isNotEmpty) {
+        _snack('Tracking done. Red stretches on the timeline are where it was unsure: '
+            'scrub through them.');
+      }
+    } on ExportException catch (e) {
+      _showError('Couldn\'t track that:\n${e.message}');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _status = null;
+        });
+      }
+    }
+    _requestRender();
+  }
+
+  /// Put the box where the user just drew it on this frame, and re-track
+  /// between the nearest hand-placed frames on either side.
+  Future<void> _applyFix(_BlurDraw d, Rect box) async {
+    final r = d.fixing!;
+    setState(() {
+      _draw = null;
+      _busy = true;
+      _status = 'Tracking…';
+    });
+    try {
+      final anchor = d.anchor;
+      final others = r.anchors.where((a) => (a - anchor).abs() > 0.02).toList()..sort();
+      double? prev, next;
+      for (final a in others) {
+        if (a < anchor) prev = a;
+        if (a > anchor && next == null) next = a;
+      }
+      final fresh = await _exporter.track(
+        path: d.clip.path,
+        anchor: anchor,
+        rect: box,
+        rangeStart: prev ?? r.start,
+        rangeEnd: next ?? r.end,
+      );
+      final kept = [
+        for (final s in r.samples)
+          if ((prev != null && s.t <= prev) || (next != null && s.t >= next)) s,
+      ];
+      final inside = [
+        for (final s in fresh)
+          if ((prev == null || s.t > prev) && (next == null || s.t < next)) s,
+      ];
+      r.samples = [...kept, ...inside]..sort((a, b) => a.t.compareTo(b.t));
+      r.anchors = [...others, anchor]..sort();
+      if (mounted) setState(() {});
+    } on ExportException catch (e) {
+      _showError('Couldn\'t track that:\n${e.message}');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _status = null;
+        });
+      }
+    }
+    _requestRender();
+  }
+
+  void _removeBlur(BlurRegion r) {
+    setState(() => _blurs.removeWhere((b) => b.id == r.id));
+    _requestRender();
+  }
+
+  void _setLook(BlurRegion r, {BlurStyle? style, PixelScale? scale}) {
+    setState(() {
+      if (style != null) r.style = style;
+      if (scale != null) r.scale = scale;
+    });
+    _lastLook = BlurLook(r.style, r.scale);
+    _requestRender();
+  }
+
+  bool _isActiveNow(BlurRegion r) {
+    final clip = _clipAt(_playhead);
+    return clip != null && clip.id == r.clipId && r.contains(_localSeconds(clip, _playhead));
+  }
+
+  Future<void> _blurMenu(BlurRegion r, Offset global) async {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromRect(
+          Rect.fromLTWH(global.dx, global.dy, 0, 0), Offset.zero & overlay.size),
+      items: [
+        const PopupMenuItem(value: 'remove', child: Text('Remove blur')),
+        if (r.kind == BlurKind.object && _isActiveNow(r))
+          const PopupMenuItem(value: 'fix', child: Text('Fix box on this frame…')),
+        const PopupMenuDivider(),
+        for (final st in BlurStyle.values)
+          PopupMenuItem(
+            value: 'style:${st.wire}',
+            child: Row(children: [
+              SizedBox(width: 22, child: r.style == st ? const Icon(Icons.check, size: 18) : null),
+              Text(st.label),
+            ]),
+          ),
+        if (r.style.hasScale) ...[
+          const PopupMenuDivider(),
+          for (final s in PixelScale.values)
+            PopupMenuItem(
+              value: 'scale:${s.wire}',
+              child: Row(children: [
+                SizedBox(width: 22, child: r.scale == s ? const Icon(Icons.check, size: 18) : null),
+                Text('Strength: ${r.style.labelFor(s)}'),
+              ]),
+            ),
+        ],
+      ],
+    );
+    if (choice == null) return;
+    if (choice == 'remove') {
+      _removeBlur(r);
+    } else if (choice == 'fix') {
+      await _startFix(r);
+    } else if (choice.startsWith('style:')) {
+      _setLook(r, style: BlurStyle.values.firstWhere((s) => s.wire == choice.substring(6)));
+    } else if (choice.startsWith('scale:')) {
+      _setLook(r, scale: PixelScale.values.firstWhere((s) => s.wire == choice.substring(6)));
+    }
+  }
+
+  /// Right-click on the preview: if it's on a pixelated box, offer the menu.
+  void _onVideoSecondaryTap(Offset canvasPoint, Offset global) {
+    if (_draw != null) return;
+    final clip = _clipAt(_playhead);
+    final mapper = clip == null ? null : _mapperFor(clip);
+    if (clip == null || mapper == null) return;
+    final local = _localSeconds(clip, _playhead);
+    BlurRegion? hit;
+    var smallest = double.infinity;
+    for (final r in _blurs) {
+      if (r.clipId != clip.id) continue;
+      for (final box in r.rectsAt(local)) {
+        final shown = mapper.paddedOnCanvas(box, text: r.kind == BlurKind.text);
+        if (shown.contains(canvasPoint) && shown.width * shown.height < smallest) {
+          smallest = shown.width * shown.height;
+          hit = r;
+        }
+      }
+    }
+    if (hit != null) _blurMenu(hit, global);
+  }
+
+  /// Outlines to draw on the preview for the blurs active at the playhead.
+  List<OverlayBox> _overlayBoxes() {
+    if (_blurs.isEmpty) return const [];
+    final clip = _clipAt(_playhead);
+    final mapper = clip == null ? null : _mapperFor(clip);
+    if (clip == null || mapper == null) return const [];
+    final local = _localSeconds(clip, _playhead);
+    return [
+      for (final r in _blurs)
+        if (r.clipId == clip.id)
+          for (final box in r.rectsAt(local))
+            OverlayBox(
+              id: r.id,
+              rect: mapper.paddedOnCanvas(box, text: r.kind == BlurKind.text),
+              unsure: r.isUnsureAt(local),
+            ),
+    ];
+  }
+
+  List<BlurSpan> _blurSpans() {
+    final starts = _clipStarts;
+    final spans = <BlurSpan>[];
+    for (final r in _blurs) {
+      final i = _clips.indexWhere((c) => c.id == r.clipId);
+      if (i < 0) continue;
+      Duration at(double sec) => starts[i] + Duration(microseconds: (sec * 1e6).round());
+      spans.add(BlurSpan(
+        id: r.id,
+        start: at(r.start),
+        end: at(r.end),
+        scale: r.scale,
+        unsure: [for (final u in r.unsureSpans) (start: at(u.start), end: at(u.end))],
+        covered: r.kind == BlurKind.text
+            ? [for (final c in r.coveredSpans) (start: at(c.start), end: at(c.end))]
+            : null,
+        label: r.kind == BlurKind.text
+            ? 'Text: ${BlurLook(r.style, r.scale).description}, found in ${r.hits.length} of ${r.checked} frames read'
+            : BlurLook(r.style, r.scale).description,
+      ));
+    }
+    return spans;
+  }
+
+  BlurRegion? _blurById(int id) {
+    for (final b in _blurs) {
+      if (b.id == id) return b;
+    }
+    return null;
   }
 
   // ---------- UI ----------
@@ -517,7 +987,11 @@ class _EditorPageState extends State<EditorPage> {
             ),
         ],
       ),
-      body: Row(
+      body: CallbackShortcuts(
+        bindings: {const SingleActivator(LogicalKeyboardKey.escape): _cancelDraw},
+        child: Focus(
+          autofocus: true,
+          child: Row(
         children: [
           _ClipSidebar(
             clips: _clips,
@@ -539,7 +1013,18 @@ class _EditorPageState extends State<EditorPage> {
                             aspectRatio: v.value.aspectRatio == 0
                                 ? 16 / 9
                                 : v.value.aspectRatio,
-                            child: VideoPlayer(v),
+                            child: Stack(
+                              fit: StackFit.expand,
+                              children: [
+                                VideoPlayer(v),
+                                BlurOverlay(
+                                  drawing: _draw != null,
+                                  boxes: _overlayBoxes(),
+                                  onDrawn: _onBoxDrawn,
+                                  onSecondaryTap: _onVideoSecondaryTap,
+                                ),
+                              ],
+                            ),
                           )
                         : _EmptyState(onPick: _addClips),
                   ),
@@ -566,6 +1051,13 @@ class _EditorPageState extends State<EditorPage> {
                           onApply: _apply,
                           canApply: _model.hasContent && !_busy && !_rendering,
                           pointCount: _model.points.length,
+                          onBlur: _startBlur,
+                          onBlurText: () => _startBlur(text: true),
+                          canBlur: _video != null && !_busy,
+                          drawing: _draw != null,
+                          fixing: _draw?.fixing != null,
+                          drawingText: _draw?.text ?? false,
+                          onCancelDraw: _cancelDraw,
                         ),
                         const SizedBox(height: 10),
                         Timeline(
@@ -576,6 +1068,18 @@ class _EditorPageState extends State<EditorPage> {
                           onSeek: _seek,
                           onToggleSegment: _toggleSegment,
                           onTransitionTap: _editTransition,
+                          blurSpans: _blurSpans(),
+                          onBlurTap: (id) {
+                            final r = _blurById(id);
+                            final i = r == null ? -1 : _clips.indexWhere((c) => c.id == r.clipId);
+                            if (r != null && i >= 0) {
+                              _seek(_clipStarts[i] + Duration(microseconds: (r.start * 1e6).round()));
+                            }
+                          },
+                          onBlurMenu: (id, global) {
+                            final r = _blurById(id);
+                            if (r != null) _blurMenu(r, global);
+                          },
                         ),
                         if (_status != null) ...[
                           const SizedBox(height: 8),
@@ -588,6 +1092,12 @@ class _EditorPageState extends State<EditorPage> {
                               ),
                               const SizedBox(width: 10),
                               Text(_status!),
+                              if (_searching) ...[
+                                const SizedBox(width: 12),
+                                TextButton(
+                                    onPressed: () => _exporter.cancel(),
+                                    child: const Text('Cancel')),
+                              ],
                             ],
                           ),
                         ],
@@ -599,9 +1109,35 @@ class _EditorPageState extends State<EditorPage> {
             ),
           ),
         ],
+          ),
+        ),
       ),
     );
   }
+}
+
+/// What the user is currently drawing: a new blur over a stretch of one clip,
+/// or a corrected box for an existing one ([fixing]).
+class _BlurDraw {
+  const _BlurDraw({
+    required this.clip,
+    required this.anchor,
+    required this.rangeStart,
+    required this.rangeEnd,
+    this.fixing,
+    this.text = false,
+  });
+
+  final Clip clip;
+
+  /// Clip time (seconds) of the frame being drawn on.
+  final double anchor;
+  final double rangeStart;
+  final double rangeEnd;
+  final BlurRegion? fixing;
+
+  /// Drawing a box around text to search for, rather than around an object to track.
+  final bool text;
 }
 
 /// Combined transition picker — type and duration in one popup.
@@ -816,6 +1352,13 @@ class _Toolbar extends StatelessWidget {
     required this.onApply,
     required this.canApply,
     required this.pointCount,
+    required this.onBlur,
+    required this.onBlurText,
+    required this.canBlur,
+    required this.drawing,
+    required this.fixing,
+    required this.drawingText,
+    required this.onCancelDraw,
   });
 
   final bool hasContent;
@@ -829,6 +1372,13 @@ class _Toolbar extends StatelessWidget {
   final VoidCallback onApply;
   final bool canApply;
   final int pointCount;
+  final VoidCallback onBlur;
+  final VoidCallback onBlurText;
+  final bool canBlur;
+  final bool drawing;
+  final bool fixing;
+  final bool drawingText;
+  final VoidCallback onCancelDraw;
 
   @override
   Widget build(BuildContext context) {
@@ -852,6 +1402,42 @@ class _Toolbar extends StatelessWidget {
           icon: const Icon(Icons.clear_all),
           label: Text('Clear points${pointCount > 0 ? ' ($pointCount)' : ''}'),
         ),
+        if (drawing)
+          Tooltip(
+            message: fixing
+                ? 'Drag a box where it belongs on this frame (Esc cancels)'
+                : (drawingText
+                    ? 'Drag a box around the text to hide (Esc cancels)'
+                    : 'Drag a box over what to hide (Esc cancels)'),
+            child: FilledButton.tonalIcon(
+              onPressed: onCancelDraw,
+              icon: const Icon(Icons.close),
+              label: const Text('Cancel blur'),
+            ),
+          )
+        else ...[
+          Tooltip(
+            message: 'Hide a face, a license plate, any thing that moves: mark the video just '
+                'before and just after it appears, put the playhead anywhere between, then '
+                'draw a box around it. The box follows it.',
+            child: OutlinedButton.icon(
+              onPressed: (hasContent && canBlur) ? onBlur : null,
+              icon: const Icon(Icons.blur_on),
+              label: const Text('Blur box'),
+            ),
+          ),
+          Tooltip(
+            message: 'Hide some text, such as an address, every place it appears: mark the video '
+                'before and after it is on screen, put the playhead on a frame where you can read '
+                'it, then draw a box around it. It is read, then found again on the other frames, '
+                'even when it moves or shows up more than once.',
+            child: OutlinedButton.icon(
+              onPressed: (hasContent && canBlur) ? onBlurText : null,
+              icon: const Icon(Icons.text_fields),
+              label: const Text('Blur text'),
+            ),
+          ),
+        ],
         const SizedBox(width: 8),
         Text(
           '${_fmt(playhead)} / ${_fmt(total)}',
