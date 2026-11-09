@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:videoz/editor_model.dart';
+import 'package:videoz/export_settings.dart';
 
 void main() {
   test('segments, transitions, and seams derive correctly', () {
@@ -44,5 +45,17 @@ void main() {
     // Split the removed segment; output must not change (still only [0,2] kept).
     m.addPoint(const Duration(seconds: 6));
     expect(m.keptDuration, const Duration(seconds: 2));
+  });
+
+  test('export settings use the names the native side expects', () {
+    // These strings are matched in macos/Runner/VideoExporter.swift (Settings).
+    expect(Compression.values.map((c) => c.wire),
+        ['none', 'light', 'medium', 'heavy']);
+    expect(ExportFormat.mp4.extension, 'mp4');
+    expect(ExportFormat.mov.extension, 'mov');
+    // Defaults: MP4, uncompressed.
+    const d = ExportSettings();
+    expect(d.format, ExportFormat.mp4);
+    expect(d.compression, Compression.none);
   });
 }

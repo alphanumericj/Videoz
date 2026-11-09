@@ -18,6 +18,8 @@ class VideoExporter {
   private let channel: FlutterMethodChannel
   private var progressTimer: Timer?
   private var currentSession: AVAssetExportSession?
+  private var currentReader: AVAssetReader?
+  private var currentWriter: AVAssetWriter?
 
   init(messenger: FlutterBinaryMessenger) {
     channel = FlutterMethodChannel(name: "videoz/export", binaryMessenger: messenger)
@@ -39,6 +41,46 @@ class VideoExporter {
   /// equivalent). Everything else uses the plain layer-instruction path below.
   private static let customCompositorTypes: Set<String> = ["pagecurl", "blinds"]
 
+  /// Compression chosen in the Save dialog. "none" keeps the original frame
+  /// size and lets AVAssetExportSession pick a high-quality encode. The other
+  /// tiers cap the short side of the frame (so portrait video isn't squashed)
+  /// and encode in constant-quality mode: the encoder spends only the bits the
+  /// picture needs, so a mostly static screen recording shrinks a lot while
+  /// busy footage costs more. (A fixed bitrate spends its target on every
+  /// video, which left a 195 MB screen recording at 52 MB.)
+  private struct Settings {
+    let tier: String // "none" | "light" | "medium" | "heavy"
+
+    var isCompressed: Bool { limits != nil }
+
+    /// (max short side in px, encoder quality 0...1)
+    private var limits: (shortSide: Double, quality: Double)? {
+      switch tier {
+      case "light": return (1080, 0.65)
+      case "medium": return (720, 0.55)
+      case "heavy": return (480, 0.45)
+      default: return nil
+      }
+    }
+
+    var quality: Double { limits?.quality ?? 0.5 }
+
+    /// Scale down (never up) to the tier's cap; H.264 needs even dimensions.
+    func scaledSize(_ size: CGSize) -> CGSize {
+      guard let l = limits else { return size }
+      var w = size.width, h = size.height
+      let short = min(w, h)
+      if short > l.shortSide {
+        let k = l.shortSide / short
+        w *= k
+        h *= k
+      }
+      return CGSize(width: max(2, floor(w / 2) * 2), height: max(2, floor(h / 2) * 2))
+    }
+  }
+
+  private final class ProgressBox { var value = 0.0 }
+
   private func handle(_ call: FlutterMethodCall, _ result: @escaping FlutterResult) {
     switch call.method {
     case "render":
@@ -58,7 +100,16 @@ class VideoExporter {
                      cfAfter: (p["cfAfter"] as? Double) ?? 0,
                      typeAfter: (p["type"] as? String) ?? "crossfade")
       }
-      render(pieces: pieces, output: output, result: result)
+      let settings = Settings(tier: (args["compression"] as? String) ?? "none")
+      render(pieces: pieces, output: output, settings: settings, result: result)
+    case "remux":
+      guard let args = call.arguments as? [String: Any],
+            let input = args["input"] as? String,
+            let output = args["output"] as? String else {
+        result(FlutterError(code: "bad_args", message: "Missing remux arguments", details: nil))
+        return
+      }
+      remux(input: input, output: output, result: result)
     case "probe":
       guard let args = call.arguments as? [String: Any],
             let path = args["path"] as? String else {
@@ -75,6 +126,8 @@ class VideoExporter {
       thumbnails(rawRequests, result: result)
     case "cancel":
       currentSession?.cancelExport()
+      currentReader?.cancelReading()
+      currentWriter?.cancelWriting()
       result(nil)
     default:
       result(FlutterMethodNotImplemented)
@@ -138,7 +191,7 @@ class VideoExporter {
     }
   }
 
-  private func render(pieces: [Piece], output: String, result: @escaping FlutterResult) {
+  private func render(pieces: [Piece], output: String, settings: Settings, result: @escaping FlutterResult) {
     let usable = pieces.filter { $0.length > 0 }
     if usable.isEmpty {
       result(FlutterError(code: "empty", message: "Nothing to render.", details: nil))
@@ -146,7 +199,7 @@ class VideoExporter {
     }
 
     if usable.contains(where: { Self.customCompositorTypes.contains($0.typeAfter) }) {
-      renderCustom(pieces: usable, output: output, result: result)
+      renderCustom(pieces: usable, output: output, settings: settings, result: result)
       return
     }
 
@@ -182,7 +235,7 @@ class VideoExporter {
 
       if placed.isEmpty {
         let r = CGRect(origin: .zero, size: srcV.naturalSize).applying(srcV.preferredTransform)
-        renderSize = CGSize(width: abs(r.width), height: abs(r.height))
+        renderSize = settings.scaledSize(CGSize(width: abs(r.width), height: abs(r.height)))
         let fr = Int32(srcV.nominalFrameRate.rounded())
         frameRate = fr > 0 ? fr : 30
       }
@@ -267,35 +320,10 @@ class VideoExporter {
     videoComposition.frameDuration = CMTime(value: 1, timescale: frameRate)
     videoComposition.instructions = instructions
 
-    guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-      result(FlutterError(code: "no_session", message: "Couldn't create an export session.", details: nil))
-      return
-    }
-    let outURL = URL(fileURLWithPath: output)
-    try? FileManager.default.removeItem(at: outURL)
-    session.outputURL = outURL
-    session.outputFileType = Self.fileType(for: output)
-    session.videoComposition = videoComposition
-    if !audioMix.inputParameters.isEmpty { session.audioMix = audioMix }
-    session.shouldOptimizeForNetworkUse = true
-    currentSession = session
-
-    startProgressTimer(session)
-    session.exportAsynchronously { [weak self] in
-      DispatchQueue.main.async {
-        self?.stopProgressTimer()
-        self?.currentSession = nil
-        switch session.status {
-        case .completed:
-          result(nil)
-        case .cancelled:
-          result(FlutterError(code: "cancelled", message: "Render cancelled.", details: nil))
-        default:
-          let msg = session.error?.localizedDescription ?? "Unknown render error."
-          result(FlutterError(code: "render_failed", message: msg, details: nil))
-        }
-      }
-    }
+    runExport(
+      composition: composition, videoComposition: videoComposition, audioMix: audioMix,
+      output: output, settings: settings, frameRate: frameRate,
+      result: result)
   }
 
   /// Build the video instruction for one transition [range] between the
@@ -375,7 +403,7 @@ class VideoExporter {
   // slide/no-transition renders are completely unaffected and keep using the
   // already-verified AVFoundation-ramp implementation.
 
-  private func renderCustom(pieces: [Piece], output: String, result: @escaping FlutterResult) {
+  private func renderCustom(pieces: [Piece], output: String, settings: Settings, result: @escaping FlutterResult) {
     let composition = AVMutableComposition()
     guard
       let vA = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
@@ -407,7 +435,7 @@ class VideoExporter {
 
       if placed.isEmpty {
         let r = CGRect(origin: .zero, size: srcV.naturalSize).applying(srcV.preferredTransform)
-        renderSize = CGSize(width: abs(r.width), height: abs(r.height))
+        renderSize = settings.scaledSize(CGSize(width: abs(r.width), height: abs(r.height)))
         let fr = Int32(srcV.nominalFrameRate.rounded())
         frameRate = fr > 0 ? fr : 30
       }
@@ -487,6 +515,44 @@ class VideoExporter {
     videoComposition.instructions = instructions
     videoComposition.customVideoCompositorClass = TransitionCompositor.self
 
+    runExport(
+      composition: composition, videoComposition: videoComposition, audioMix: audioMix,
+      output: output, settings: settings, frameRate: frameRate,
+      result: result)
+  }
+
+  // MARK: - Export back ends
+
+  private func runExport(
+    composition: AVMutableComposition,
+    videoComposition: AVMutableVideoComposition,
+    audioMix: AVMutableAudioMix,
+    output: String,
+    settings: Settings,
+    frameRate: Int32,
+    result: @escaping FlutterResult
+  ) {
+    if settings.isCompressed {
+      exportWithWriter(
+        composition: composition, videoComposition: videoComposition, audioMix: audioMix,
+        output: output, settings: settings, frameRate: frameRate,
+        result: result)
+    } else {
+      exportWithSession(
+        composition: composition, videoComposition: videoComposition, audioMix: audioMix,
+        output: output, result: result)
+    }
+  }
+
+  /// Uncompressed path: AVAssetExportSession's highest-quality preset, which
+  /// keeps the composition's frame size.
+  private func exportWithSession(
+    composition: AVMutableComposition,
+    videoComposition: AVMutableVideoComposition,
+    audioMix: AVMutableAudioMix,
+    output: String,
+    result: @escaping FlutterResult
+  ) {
     guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
       result(FlutterError(code: "no_session", message: "Couldn't create an export session.", details: nil))
       return
@@ -498,9 +564,12 @@ class VideoExporter {
     session.videoComposition = videoComposition
     if !audioMix.inputParameters.isEmpty { session.audioMix = audioMix }
     session.shouldOptimizeForNetworkUse = true
-    currentSession = session
+    runSession(session, failCode: "render_failed", result: result)
+  }
 
-    startProgressTimer(session)
+  private func runSession(_ session: AVAssetExportSession, failCode: String, result: @escaping FlutterResult) {
+    currentSession = session
+    startProgressTimer { Double(session.progress) }
     session.exportAsynchronously { [weak self] in
       DispatchQueue.main.async {
         self?.stopProgressTimer()
@@ -512,15 +581,198 @@ class VideoExporter {
           result(FlutterError(code: "cancelled", message: "Render cancelled.", details: nil))
         default:
           let msg = session.error?.localizedDescription ?? "Unknown render error."
-          result(FlutterError(code: "render_failed", message: msg, details: nil))
+          result(FlutterError(code: failCode, message: msg, details: nil))
         }
       }
     }
   }
 
-  private func startProgressTimer(_ session: AVAssetExportSession) {
+  /// Convert a single untouched file to another container (e.g. .mov to .mp4)
+  /// by copying its streams as-is: instant and lossless. Reports
+  /// "remux_unsupported" when the streams can't live in that container (ProRes
+  /// in an .mp4, say) so the caller can fall back to a normal re-encode.
+  private func remux(input: String, output: String, result: @escaping FlutterResult) {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: input))
+    let type = Self.fileType(for: output)
+    guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough),
+          session.supportedFileTypes.contains(type)
+    else {
+      result(FlutterError(
+        code: "remux_unsupported",
+        message: "This file can't be copied into that format without re-encoding.",
+        details: nil))
+      return
+    }
+    let outURL = URL(fileURLWithPath: output)
+    try? FileManager.default.removeItem(at: outURL)
+    session.outputURL = outURL
+    session.outputFileType = type
+    session.shouldOptimizeForNetworkUse = true
+    runSession(session, failCode: "remux_failed", result: result)
+  }
+
+  /// Compressed path: read the composed frames and encode H.264 in
+  /// constant-quality mode (AVAssetExportSession can't, and its Medium/Low
+  /// presets ignore the frame size). Audio is re-encoded as 128 kbps AAC.
+  private func exportWithWriter(
+    composition: AVMutableComposition,
+    videoComposition: AVMutableVideoComposition,
+    audioMix: AVMutableAudioMix,
+    output: String,
+    settings: Settings,
+    frameRate: Int32,
+    result: @escaping FlutterResult
+  ) {
+    let outURL = URL(fileURLWithPath: output)
+    try? FileManager.default.removeItem(at: outURL)
+    let reader: AVAssetReader
+    let writer: AVAssetWriter
+    do {
+      reader = try AVAssetReader(asset: composition)
+      writer = try AVAssetWriter(outputURL: outURL, fileType: Self.fileType(for: output))
+    } catch {
+      result(FlutterError(code: "no_session", message: error.localizedDescription, details: nil))
+      return
+    }
+    writer.shouldOptimizeForNetworkUse = true
+
+    let size = videoComposition.renderSize
+    let videoOut = AVAssetReaderVideoCompositionOutput(
+      videoTracks: composition.tracks(withMediaType: .video),
+      videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA)])
+    videoOut.videoComposition = videoComposition
+    let fps = Int(max(frameRate, 1))
+    let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: [
+      AVVideoCodecKey: AVVideoCodecType.h264,
+      AVVideoWidthKey: Int(size.width),
+      AVVideoHeightKey: Int(size.height),
+      AVVideoCompressionPropertiesKey: [
+        AVVideoQualityKey: settings.quality,
+        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+        AVVideoExpectedSourceFrameRateKey: fps,
+        AVVideoMaxKeyFrameIntervalKey: fps * 2,
+      ] as [String: Any],
+    ])
+    videoIn.expectsMediaDataInRealTime = false
+    guard reader.canAdd(videoOut), writer.canAdd(videoIn) else {
+      result(FlutterError(code: "no_session", message: "Couldn't set up the video encoder.", details: nil))
+      return
+    }
+    reader.add(videoOut)
+    writer.add(videoIn)
+
+    // Only add audio when something was actually placed on an audio track.
+    let audioTracks = composition.tracks(withMediaType: .audio)
+    var audioPair: (AVAssetReaderAudioMixOutput, AVAssetWriterInput)?
+    if audioTracks.contains(where: { !$0.segments.isEmpty }) {
+      let audioOut = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+        AVSampleRateKey: 44100,
+        AVNumberOfChannelsKey: 2,
+      ])
+      if !audioMix.inputParameters.isEmpty { audioOut.audioMix = audioMix }
+      let audioIn = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: 44100,
+        AVNumberOfChannelsKey: 2,
+        AVEncoderBitRateKey: 128_000,
+      ])
+      if reader.canAdd(audioOut), writer.canAdd(audioIn) {
+        reader.add(audioOut)
+        writer.add(audioIn)
+        audioPair = (audioOut, audioIn)
+      }
+    }
+
+    guard writer.startWriting() else {
+      result(FlutterError(code: "render_failed",
+                          message: writer.error?.localizedDescription ?? "Couldn't start writing the file.",
+                          details: nil))
+      return
+    }
+    guard reader.startReading() else {
+      writer.cancelWriting()
+      result(FlutterError(code: "render_failed",
+                          message: reader.error?.localizedDescription ?? "Couldn't read the video.",
+                          details: nil))
+      return
+    }
+    writer.startSession(atSourceTime: .zero)
+    currentReader = reader
+    currentWriter = writer
+
+    let totalSeconds = max(0.001, CMTimeGetSeconds(composition.duration))
+    let progress = ProgressBox()
+    startProgressTimer { progress.value }
+
+    let group = DispatchGroup()
+    func pump(_ out: AVAssetReaderOutput, _ input: AVAssetWriterInput, label: String, reportsProgress: Bool) {
+      let queue = DispatchQueue(label: label)
+      var done = false
+      group.enter()
+      input.requestMediaDataWhenReady(on: queue) {
+        while input.isReadyForMoreMediaData && !done {
+          guard let sample = out.copyNextSampleBuffer() else {
+            done = true
+            input.markAsFinished()
+            group.leave()
+            return
+          }
+          if reportsProgress {
+            let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+            progress.value = min(1, max(0, pts / totalSeconds))
+          }
+          if !input.append(sample) {
+            done = true
+            input.markAsFinished()
+            group.leave()
+            return
+          }
+        }
+      }
+    }
+    pump(videoOut, videoIn, label: "videoz.write.video", reportsProgress: true)
+    if let (audioOut, audioIn) = audioPair {
+      pump(audioOut, audioIn, label: "videoz.write.audio", reportsProgress: false)
+    }
+
+    group.notify(queue: .main) { [weak self] in
+      self?.stopProgressTimer()
+      self?.currentReader = nil
+      self?.currentWriter = nil
+      if reader.status == .cancelled {
+        writer.cancelWriting()
+        result(FlutterError(code: "cancelled", message: "Render cancelled.", details: nil))
+        return
+      }
+      if reader.status == .failed || writer.status == .failed {
+        let msg = (writer.error ?? reader.error)?.localizedDescription ?? "Unknown render error."
+        writer.cancelWriting()
+        result(FlutterError(code: "render_failed", message: msg, details: nil))
+        return
+      }
+      writer.finishWriting {
+        DispatchQueue.main.async {
+          if writer.status == .completed {
+            result(nil)
+          } else {
+            result(FlutterError(code: "render_failed",
+                                message: writer.error?.localizedDescription ?? "Unknown render error.",
+                                details: nil))
+          }
+        }
+      }
+    }
+  }
+
+  private func startProgressTimer(_ current: @escaping () -> Double) {
+    progressTimer?.invalidate()
     progressTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-      self?.channel.invokeMethod("progress", arguments: Double(session.progress))
+      self?.channel.invokeMethod("progress", arguments: current())
     }
   }
 

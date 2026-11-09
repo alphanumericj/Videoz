@@ -7,7 +7,9 @@ import 'package:video_player/video_player.dart';
 
 import 'clip.dart';
 import 'editor_model.dart';
+import 'export_dialog.dart';
 import 'export_service.dart';
+import 'export_settings.dart';
 import 'timeline.dart';
 
 class EditorPage extends StatefulWidget {
@@ -383,30 +385,68 @@ class _EditorPageState extends State<EditorPage> {
       return;
     }
 
+    // One whole clip with no cuts or transitions: "no compression" can convert
+    // by copying the video into the new container instead of re-encoding it.
+    final convertOnly = _isTrivialSingleClip;
+    final settings = await showDialog<ExportSettings>(
+      context: context,
+      builder: (_) => ExportDialog(canConvertOnly: convertOnly),
+    );
+    if (settings == null) return;
+
     final ref = _clips.first.path;
+    final ext = settings.format.extension;
+    final copyOnly = convertOnly && settings.compression == Compression.none;
+    // A pure format change keeps the name; anything else gets "-edited" so it
+    // can't be mistaken for (or overwrite) the original.
+    final sameFormat = p.extension(ref).toLowerCase() == '.$ext';
     final base = p.basenameWithoutExtension(ref);
-    final ext = _clips.length > 1 ? '.mov' : p.extension(ref);
-    final outPath = await FilePicker.platform.saveFile(
-      dialogTitle: 'Save edited file as',
-      fileName: '$base-edited$ext',
+    final suggested = (copyOnly && !sameFormat) ? '$base.$ext' : '$base-edited.$ext';
+
+    var outPath = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save as ${settings.format.label}',
+      fileName: suggested,
       initialDirectory: p.dirname(ref),
+      type: FileType.custom,
+      allowedExtensions: [ext],
     );
     if (outPath == null) return;
+    // The extension decides the container, so make it match the chosen format.
+    final typed = p.extension(outPath).toLowerCase();
+    if (typed != '.$ext') {
+      outPath = const ['.mp4', '.mov', '.m4v'].contains(typed)
+          ? p.setExtension(outPath, '.$ext')
+          : '$outPath.$ext';
+    }
+
+    void onProgress(double pr) {
+      if (mounted) setState(() => _status = 'Exporting… ${(pr * 100).round()}%');
+    }
 
     setState(() {
       _busy = true;
-      _status = 'Exporting… 0%';
+      _status = copyOnly ? 'Converting…' : 'Exporting… 0%';
     });
     try {
-      await _exporter.render(
-        pieces: _buildPieces(),
-        outputPath: outPath,
-        onProgress: (pr) {
-          if (mounted) {
-            setState(() => _status = 'Exporting… ${(pr * 100).round()}%');
-          }
-        },
-      );
+      var done = false;
+      if (copyOnly) {
+        try {
+          await _exporter.remux(
+              inputPath: ref, outputPath: outPath, onProgress: onProgress);
+          done = true;
+        } on ExportException {
+          // Can't be copied as-is (ProRes into an .mp4, say): re-encode below.
+          if (mounted) setState(() => _status = 'Exporting… 0%');
+        }
+      }
+      if (!done) {
+        await _exporter.render(
+          pieces: _buildPieces(),
+          outputPath: outPath,
+          compression: settings.compression,
+          onProgress: onProgress,
+        );
+      }
       if (mounted) {
         setState(() => _status = null);
         _showDone(outPath);
@@ -435,9 +475,13 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   void _showDone(String path) {
+    var size = '';
+    try {
+      size = ' (${_fmtSize(File(path).lengthSync())})';
+    } catch (_) {}
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('Wrote ${p.basename(path)}'),
-      duration: const Duration(seconds: 4),
+      content: Text('Wrote ${p.basename(path)}$size'),
+      duration: const Duration(seconds: 6),
     ));
   }
 
@@ -855,6 +899,12 @@ class _EmptyState extends StatelessWidget {
       ],
     );
   }
+}
+
+String _fmtSize(int bytes) {
+  const mb = 1024 * 1024;
+  if (bytes >= mb) return '${(bytes / mb).toStringAsFixed(1)} MB';
+  return '${(bytes / 1024).toStringAsFixed(0)} KB';
 }
 
 String _fmt(Duration d) {

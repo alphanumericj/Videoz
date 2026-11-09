@@ -157,12 +157,51 @@ Regeneration is gated on a signature (row width + every segment's
 start/end/removed-state + the clip list), so it only actually re-fetches when
 something relevant changed.
 
+## Convert and compress (2026-11-09)
+
+**Apply & Save** now asks for a format (MP4 or MOV, MP4 by default) and a
+compression level before the save panel opens.
+
+- **Convert only.** One whole clip with no cuts or transitions and no
+  compression is converted by copying its streams into the new container
+  (`AVAssetExportPresetPassthrough`): instant and lossless. When that isn't
+  possible (ProRes into an `.mp4`, for example) it falls back to a normal
+  re-encode automatically.
+- **Compression levels** (Light / Medium / Heavy = up to 1080p / 720p / 480p).
+  The cap applies to the *short* side of the frame, so portrait video isn't
+  squashed, and video is never scaled up. The video is encoded as H.264 in
+  **constant-quality mode** (quality 0.65 / 0.55 / 0.45) through `AVAssetReader`
+  + `AVAssetWriter`, with audio as 128 kbps AAC.
+- **Why constant quality, not a bitrate?** The first version used a fixed
+  bitrate per tier. Apple's encoder spends a fixed bitrate on every video,
+  however static, so a 195 MB screen recording (1280x588, mostly still) only
+  came down to 52 MB, while x264 at constant quality had made it 9.6 MB.
+  x264 is GPL, so it can't ship in the app; the hardware encoder's own
+  constant-quality mode adapts the same way. Same file, Heavy: 9.5 MB.
+- **Why not the system export presets?** Tested on a 1080p clip: the Medium
+  and Low presets ignore the frame size and force tiny output (568x320,
+  224x128), and HighestQuality picks its own bitrate regardless of the source
+  (a 2.8 MB low-bitrate 1080p recording came out at 7.5 MB).
+- Because size depends on the footage, it isn't predictable ahead of time:
+  calm screen recordings shrink a lot, busy gameplay or camera footage less.
+  The snackbar after saving shows the resulting size.
+- Measured: `GG.mov` (195 MB, 3.5 min, 1280x588 screen recording) gives Light
+  29.8 MB, Medium 20.3 MB, Heavy 9.5 MB. A 10 second 1080p, 20 Mbps clip
+  (23.4 MB) gives None 12.3 MB (preset), Medium 2.2 MB; convert-only copies a
+  file in about 0.1 s.
+- This works with transitions too, including the custom page curl/blinds
+  compositor, since the writer reads the composed frames.
+- The native tiers live in `Settings` in `macos/Runner/VideoExporter.swift`;
+  `lib/export_settings.dart` only holds the names (a unit test keeps them in
+  sync).
+
 ## Roadmap
 
 - [x] Join multiple separate clips
 - [x] Crossfade at any cut point (clip boundary or within a video)
 - [x] More transitions (fade to black, slide) — picked in the same popup as duration
 - [x] Filmstrip thumbnails on the timeline
+- [x] Convert to MP4/MOV and compress on save
 - [ ] Bulk "crossfade all joins" convenience control
 - [ ] Draggable / individually-deletable cut points
 - [ ] Live preview without re-render (native AVPlayer view) for long clips

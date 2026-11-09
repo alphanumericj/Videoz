@@ -1,5 +1,7 @@
 import 'package:flutter/services.dart';
 
+import 'export_settings.dart';
+
 /// A single filmstrip-thumbnail request: [time] seconds into the file at [path].
 class ThumbRequest {
   const ThumbRequest({required this.path, required this.time});
@@ -10,8 +12,11 @@ class ThumbRequest {
 }
 
 class ExportException implements Exception {
-  ExportException(this.message);
+  ExportException(this.message, {this.code});
   final String message;
+
+  /// The native error code, when there is one (e.g. `remux_failed`).
+  final String? code;
   @override
   String toString() => message;
 }
@@ -65,6 +70,7 @@ class ExportService {
   Future<void> render({
     required List<RenderPiece> pieces,
     required String outputPath,
+    Compression compression = Compression.none,
     void Function(double progress)? onProgress,
   }) async {
     if (pieces.isEmpty) {
@@ -75,9 +81,32 @@ class ExportService {
       await _channel.invokeMethod<void>('render', {
         'pieces': pieces.map((p) => p.toMap()).toList(),
         'output': outputPath,
+        'compression': compression.wire,
       });
     } on PlatformException catch (e) {
-      throw ExportException(e.message ?? 'Render failed (${e.code}).');
+      throw ExportException(e.message ?? 'Render failed (${e.code}).', code: e.code);
+    } finally {
+      _onProgress = null;
+    }
+  }
+
+  /// Convert one untouched file to the container implied by [outputPath]'s
+  /// extension by copying its streams: instant and lossless. Throws
+  /// [ExportException] (code `remux_unsupported` / `remux_failed`) when the
+  /// streams can't live in that container, so the caller can re-encode.
+  Future<void> remux({
+    required String inputPath,
+    required String outputPath,
+    void Function(double progress)? onProgress,
+  }) async {
+    _onProgress = onProgress;
+    try {
+      await _channel.invokeMethod<void>('remux', {
+        'input': inputPath,
+        'output': outputPath,
+      });
+    } on PlatformException catch (e) {
+      throw ExportException(e.message ?? 'Convert failed (${e.code}).', code: e.code);
     } finally {
       _onProgress = null;
     }
